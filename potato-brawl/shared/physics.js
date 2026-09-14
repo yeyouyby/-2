@@ -44,6 +44,14 @@ export function moveAndCollide(b, dx, dy, solids, ledge) {
     if (!aabb(b, s)) continue;
     if (dx > 0) b.x = s.x - b.w;
     else if (dx < 0) b.x = s.x + s.w;
+    // dx 为 0 时只在 ledge（导航爬台）模式下往 penetration 小的一侧推，玩家/子弹那套保持原样
+    else if (ledge) b.x = (b.x + b.w - s.x) < (s.x + s.w - b.x) ? s.x - b.w : s.x + s.w;
+    if (s === ledge && dy < 0) {
+      // 正在往上爬的那块平台：只推出去、不清 vx、不报 hitX（贴边蹭着升上去，翻边缘那一下还要靠这个速度），
+      // 并且标记 climb 让敌人侧的「扒上边缘」修正能跑起来
+      res.climb = true;
+      continue;
+    }
     b.vx = 0;
     res.hitX = true;
   }

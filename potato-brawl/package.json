@@ -9,6 +9,7 @@
     "dev": "node --watch server/index.js",
     "test": "node test/headless-test.js",
     "test:jump": "node test/enemy-jump-test.js",
+    "test:safety": "node test/net-safety-test.js",
     "lan": "node server/index.js --host 0.0.0.0 --port 3000"
   },
   "dependencies": {

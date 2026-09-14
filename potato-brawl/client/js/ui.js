@@ -19,6 +19,13 @@ const IICON = {
 
 const $ = (id) => document.getElementById(id);
 
+// 所有来自网络（玩家名、房间名、聊天、房间列表…）的文本，进 innerHTML 之前都要过这里。
+// 服务端也剥了一遍标签字符，但这层不能省：谁都能直接连 WebSocket 发裸字符串。
+const ESC_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+const esc = (v) => String(v == null ? '' : v).replace(/[&<>"']/g, (c) => ESC_MAP[c]);
+// 颜色要拼进 style 属性，只放过安全字符
+const safeColor = (c) => (/^[#a-zA-Z0-9(),.%\s]{1,32}$/.test(String(c || '')) ? String(c) : '#fff');
+
 export class UI {
   constructor(net, audio) {
     this.net = net;
@@ -191,7 +198,7 @@ export class UI {
     const box = $('killfeed');
     const d = document.createElement('div');
     d.className = 'kf';
-    d.innerHTML = `<b style="color:${color || '#fff'}">${killer}</b> 💀 ${victim}`;
+    d.innerHTML = `<b style="color:${safeColor(color)}">${esc(killer)}</b> 💀 ${esc(victim)}`;
     box.appendChild(d);
     setTimeout(() => d.remove(), 5000);
     while (box.children.length > 5) box.firstChild.remove();
@@ -202,7 +209,7 @@ export class UI {
     for (const log of logs) {
       const d = document.createElement('div');
       if (sys) d.className = 'sys';
-      d.innerHTML = sys ? text : `<b>${name}</b>：${text}`;
+      d.innerHTML = sys ? esc(text) : `<b>${esc(name)}</b>：${esc(text)}`;
       log.appendChild(d);
       while (log.children.length > 60) log.firstChild.remove();
       log.scrollTop = log.scrollHeight;
@@ -210,7 +217,7 @@ export class UI {
     // 游戏内浮动聊天
     const g = $('game-chat-log');
     const f = document.createElement('div');
-    f.innerHTML = sys ? `<i>${text}</i>` : `<b>${name}</b>：${text}`;
+    f.innerHTML = sys ? `<i>${esc(text)}</i>` : `<b>${esc(name)}</b>：${esc(text)}`;
     g.appendChild(f);
     setTimeout(() => f.remove(), 6000);
     while (g.children.length > 6) g.firstChild.remove();
@@ -228,11 +235,12 @@ export class UI {
     for (const r of rooms) {
       const d = document.createElement('div');
       d.className = 'room-item';
-      const modeName = { pve: '合作 PvE', ffa: '死斗', team: '团队战' }[r.mode] || r.mode;
-      d.innerHTML = `<span class="code">${r.code}</span>
-        <span>${r.name}</span>
-        <span class="tag">${modeName}</span>
-        <span class="meta">${r.phase === 'game' ? '进行中 第' + r.wave + '波' : '等待中'} · ${r.players}/${r.max} 人</span>`;
+      // 兜底分支不能直接把 r.mode 塞进 innerHTML：那是房主能改的字符串（服务端已限死范围，这里再转义一层）
+      const modeName = { pve: '合作 PvE', ffa: '死斗', team: '团队战' }[r.mode] || '自定义';
+      d.innerHTML = `<span class="code">${esc(r.code)}</span>
+        <span>${esc(r.name)}</span>
+        <span class="tag">${esc(modeName)}</span>
+        <span class="meta">${r.phase === 'game' ? '进行中 第' + esc(r.wave) + '波' : '等待中'} · ${esc(r.players)}/${esc(r.max)} 人</span>`;
       d.onclick = () => this.net.send({ t: 'join', code: r.code, name: this.pickName() });
       box.appendChild(d);
     }
@@ -276,7 +284,7 @@ export class UI {
         <button class="small" data-team="0">蓝</button><button class="small" data-team="1">红</button>` : '';
       d.innerHTML = `
         <span class="dot" style="background:${['#ff6b6b', '#4dabf7', '#51cf66', '#fcc419', '#cc5de8', '#22b8cf', '#ff922b', '#f783ac'][p.slot % 8]}"></span>
-        <span class="nm">${p.name}${isMe ? ' <span class="muted small">(你)</span>' : ''}</span>
+        <span class="nm">${esc(p.name)}${isMe ? ' <span class="muted small">(你)</span>' : ''}</span>
         <span class="badges">${badges.join('')}</span>
         <span class="right">${weaponSel}${teamBtns}</span>`;
       box.appendChild(d);
@@ -522,7 +530,7 @@ export class UI {
       const st = p.a ? (p.d ? '倒地' : '存活') : '阵亡';
       const team = s.p.length && p.tm >= 0 && this.game && this.game.mode === 'team'
         ? `<span style="color:${p.tm === 0 ? '#4dabf7' : '#ff8787'}">●</span> ` : '';
-      return `<tr><td>${team}${name}</td><td>${p.l}</td><td>${p.k}</td><td>${p.dd}</td><td>${p.mx}</td><td>${st}</td></tr>`;
+      return `<tr><td>${team}${esc(name)}</td><td>${p.l}</td><td>${p.k}</td><td>${p.dd}</td><td>${p.mx}</td><td>${st}</td></tr>`;
     }).join('');
     $('sb-body').innerHTML = rows;
   }
@@ -538,7 +546,7 @@ export class UI {
         ...p.weapons.map((w) => WICON[w] || '🔫'),
         ...Object.entries(p.items).map(([k, v]) => (IICON[k] || '✨') + (v > 1 ? v : '')),
       ].join(' ');
-      return `<tr><td>${p.name}</td><td>${p.level}</td><td>${p.kills}</td><td>${p.deaths}</td><td>${p.damage}</td><td class="build">${build}</td></tr>`;
+      return `<tr><td>${esc(p.name)}</td><td>${p.level}</td><td>${p.kills}</td><td>${p.deaths}</td><td>${p.damage}</td><td class="build">${build}</td></tr>`;
     }).join('');
     $('result').classList.remove('hidden');
     if (win) this.audio.win(); else this.audio.lose();

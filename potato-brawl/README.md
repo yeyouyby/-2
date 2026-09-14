@@ -190,6 +190,7 @@ potato-brawl/
 npm test                          # 无头集成测试：PvE / FFA / TEAM 三个场景跑通
 node test/perf-test.js            # 性能基准：8 人 + 70 怪 + 满弹幕，测 tick 耗时
 node test/enemy-jump-test.js      # 敌人跳平台/二段跳回归测试（含稳定性与边界用例）
+node test/net-safety-test.js      # 联机层安全/健壮性回归（含真 WebSocket 端到端）
 node test/browser-verify.js       # 真实浏览器 E2E（需要 npx playwright install chromium）
 ```
 
@@ -204,6 +205,29 @@ node test/browser-verify.js       # 真实浏览器 E2E（需要 npx playwright 
 ---
 
 ## 四点五、改动记录
+
+### v1.0.4b · 联机层安全/健壮性修复（按 Qodo review）
+
+这一批都在 `server/src/rooms` / `server/src/net` / `client/js/ui.js`，与玩法无关，但都是真能踩到的坑：
+
+| # | 问题 | 处理 |
+| --- | --- | --- |
+| 1 | 聊天内容直接拼 `innerHTML` → 房间内任意人可以执行脚本 | 服务端 `cleanText()` 先删整段标签、再剥 `<>&"'` 和控制字符并截断；客户端 `ui.js` 加 `esc()`，聊天/房间列表/玩家名/击杀条/结算全部转义（双保险） |
+| 2 | 房间列表把 `r.mode` 原样塞进 `innerHTML` | 设置项白名单校验（见下）+ 前端兜底分支改成固定文案，未知模式只显示「自定义」 |
+| 3 | 房主可以用设置打死服务器：`difficulty` 巨大 → 刷怪预算爆炸；`levelId:'__proto__'` → 取到 `Object.prototype` | 新增 `cleanSettings()`：只认 `DEFAULT_SETTINGS` 的键，`mode`/`levelId` 走白名单，数值项按范围夹（`difficulty 0.2~3`、`totalWaves 1~60`…），非法值直接丢弃而不是崩溃 |
+| 4 | 掉线 60 秒后的清理定时器调用 `manager.leaveRoom()`，但那时 manager 记录已删 → 人永远占着名额 | 定时器分两种情况：还有记录走 `leaveRoom`，没记录直接 `room.removePlayer(drop)` |
+| 5 | 明确退出的玩家只是被标 `connected=false`，继续在对局里当活靶子 | `removePlayer(drop:true)` 同时调用 `game.removePlayer(id)` 把人从模拟里摘掉 |
+| 6 | 重连只恢复了网络侧的 `connected`，对局侧还是 false → 合作模式下一秒可能被判团灭 | 新增 `Room.reconnect(id, ws)`，网络侧和对局侧一起恢复 |
+| 7 | 对局中途加入的人只收到 `joined`，没有 `start` → 永远卡在客厅丢快照 | 抽出 `sendStart()`，建房/加入/重连三条路径都发（顺带：加入失败时把 socket 放回大厅列表，不再收不到房间更新） |
+| 8 | 敌人空中撞墙丢光水平速度（`moveAndCollide` 里已经把 vx 清零，`e.vx * 0.6` 乘的是 0） | 撞墙的动量补偿改用碰撞前的 `preVx` |
+| 9 | `decodeURIComponent` 遇到非法转义直接抛 → 一个坏请求干掉整个进程 | try/catch → 400；顺带挡 `\0` |
+| 10 | 建/加房间不先退旧房间 + 建房无上限 + 删房不清成员记录 → 单客户端可以吃掉服务器 | 先 `leaveRoom` 再进新房间；`MAX_ROOMS = 64`（满了拒绝并提示）；`removeRoom()` 连带清掉指向它的成员记录 |
+| 11 | `/client/../server/index.js` 能把服务端源码拖下来（只校验了「还在项目根里」） | 只允许 `client/`、`shared/` 两个目录，先 `normalize` 再判前缀 containment；未知后缀一概 404 |
+| 12 | 房主掉线时就把房主转交，但他自己 `host` 没清 → 60 秒内重连变双房主 | 只有永久移除才转交，转交时清掉原标记；短暂掉线保留房主权 |
+| 13 | （我自己的代码）`ledge` 只在专用分支里判，贴边那一下被普通 X 解算先吃掉 → `res.climb` 永远不成立，扒边修正跑不到 | `moveAndCollide` 里普通解算遇到 `ledge` 时只推位置、不清 vx、不报 hitX 并标记 `climb`；扒上边缘时连水平位置一起挪进台面（只抬高度会抬到空气上） |
+| 14 | `Room.tick()` 对每个人调一次 `Game.snapshot()`，而 snapshot 会清空 `events` → 只有第一个人拿到跳/命中/死亡等特效 | 拆成 `snapshotBody()`（公共部分，消费 events）+ `snapshotMe(id)`；房间每人只补自己那份，没人在线时 `clearEvents()` |
+
+回归测试：`npm run test:safety`（`test/net-safety-test.js`，60 项：文本清洗、设置白名单、房间上限与残留记录、离开/掉线/重连/快照分发、目录穿越与畸形 URI、中途加入拿到 start）。
 
 ### v1.0.4 · 地面怪会跳上平台追人（二段跳）
 

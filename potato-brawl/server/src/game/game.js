@@ -735,7 +735,17 @@ export class Game {
   }
 
   // ---------------------------------------------------------------- 快照
+  /** 快照里的公共部分（全场实体 + 本 tick 事件）。events 只能被消费一次，见 snapshotBody */
   snapshot(forId) {
+    const snap = this.snapshotBody();
+    snap.me = this.snapshotMe(forId);
+    return snap;
+  }
+
+  /** 丢掉本 tick 的事件（没人可发的时候用，免得事件一直堆着） */
+  clearEvents() { this.events.length = 0; }
+
+  snapshotBody() {
     const players = [];
     for (const p of this.players.values()) {
       players.push({
@@ -759,6 +769,25 @@ export class Game {
     }));
     const picks = this.pickups.map((k) => ({ i: k.id, t: k.type, x: r1(k.x), y: r1(k.y), v: k.v }));
 
+    const snap = {
+      t: this.tick,
+      ph: this.phase,
+      pt: r1(this.phaseTimer),
+      w: this.wave,
+      tw: this.settings.totalWaves,
+      tl: Math.round(this.timeLeft),
+      sc: this.scores,
+      ec: this.enemies.length,
+      p: players, e: enemies, b: bullets, k: picks,
+      ev: this.events,
+      me: null,
+    };
+    this.events = [];        // 事件只能被消费一次：谁拿到 ev 谁就负责把它清掉
+    return snap;
+  }
+
+  /** 某个玩家独有的那一份（血条/武器/商店/预测用的 clientTick 等） */
+  snapshotMe(forId) {
     const me = this.players.get(forId);
     let mine = null;
     if (me) {
@@ -787,20 +816,6 @@ export class Game {
       };
     }
 
-    const snap = {
-      t: this.tick,
-      ph: this.phase,
-      pt: r1(this.phaseTimer),
-      w: this.wave,
-      tw: this.settings.totalWaves,
-      tl: Math.round(this.timeLeft),
-      sc: this.scores,
-      ec: this.enemies.length,
-      p: players, e: enemies, b: bullets, k: picks,
-      ev: this.events,
-      me: mine,
-    };
-    this.events = [];
-    return snap;
+    return mine;
   }
 }

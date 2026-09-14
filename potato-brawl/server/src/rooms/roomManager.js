@@ -2,6 +2,10 @@
 import { MAX_PLAYERS } from '../../../shared/constants.js';
 import { Room, makeCode, send } from './room.js';
 
+// 单进程房间上限：没这个的话，一个客户端一直点「创建房间」就能把内存、
+// 以及每次 broadcastRoomList 的体积一起撑爆（房间列表会发给所有连接）。
+export const MAX_ROOMS = 64;
+
 export class RoomManager {
   constructor() {
     this.rooms = new Map(); // code -> Room
@@ -10,6 +14,7 @@ export class RoomManager {
   }
 
   createRoom(opts) {
+    if (this.rooms.size >= MAX_ROOMS) return null;      // 满了就别再建，调用方负责报错
     let code = makeCode();
     while (this.rooms.has(code)) code = makeCode();
     const room = new Room(this, code, opts);
@@ -23,6 +28,10 @@ export class RoomManager {
   }
 
   removeRoom(code) {
+    const room = this.rooms.get(code);
+    if (!room) return;
+    // 房间没了就把指向它的成员记录一起删掉，否则这些 socket 会一直往死房间里发消息
+    for (const id of room.players.keys()) this.players.delete(id);
     this.rooms.delete(code);
     this.broadcastRoomList();
   }

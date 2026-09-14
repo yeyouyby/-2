@@ -1,6 +1,55 @@
 // 房间：大厅状态、成员管理、消息路由、快照广播
 import { DEFAULT_SETTINGS, MODE, PHASE, MAX_PLAYERS, TICK_DT, SNAPSHOT_EVERY } from '../../../shared/constants.js';
+import { LEVELS } from '../../../shared/level.js';
 import { Game } from '../game/game.js';
+
+// 所有会被拼进浏览器 innerHTML 的文本（聊天、房间名…）都先过一遍这里：
+// 尖括号/引号/与号一律剥掉，控制字符去掉，再截断长度。客户端那边也做了转义（双保险）。
+export function cleanText(input, max = 160) {
+  return String(input == null ? '' : input)
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ')
+    .replace(/<[^>]*>/g, '')          // 整段标签直接删（<b>x</b> → x），否则只剩尖括号会糊成一坨
+    .replace(/[<>&"'`]/g, '')         // 落单的尖括号/引号也剥掉：这些都是要拼进 innerHTML 的
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, max);
+}
+
+const MODE_SET = new Set(Object.values(MODE));
+const LEVEL_SET = new Set(Object.keys(LEVELS));
+// 设置项全部来自房主的网络消息，必须限死范围：difficulty 会直接乘进刷怪预算（waves.js），
+// 给个 1e9 就能把服务器卡在构造敌人那一帧；levelId 更狠，'__proto__' 会取到 Object.prototype。
+const NUM_RANGE = {
+  maxPlayers: [1, MAX_PLAYERS, true],
+  totalWaves: [1, 60, true],
+  difficulty: [0.2, 3, false],
+  prepTime: [3, 120, true],
+  scoreLimit: [1, 200, true],
+  timeLimit: [30, 3600, true],
+  teamSize: [1, MAX_PLAYERS, true],
+};
+
+/** 只认 DEFAULT_SETTINGS 里的键（顺带挡掉 __proto__ 之类），非法值一律丢弃 */
+export function cleanSettings(input, current) {
+  const out = { ...(current || DEFAULT_SETTINGS) };
+  const src = input && typeof input === 'object' ? input : {};
+  for (const k of Object.keys(DEFAULT_SETTINGS)) {
+    if (!Object.prototype.hasOwnProperty.call(src, k)) continue;
+    const v = src[k];
+    if (k === 'mode') { if (MODE_SET.has(v)) out.mode = v; continue; }
+    if (k === 'levelId') {
+      if (typeof v === 'string' && LEVEL_SET.has(v)) out.levelId = v;
+      continue;
+    }
+    const range = NUM_RANGE[k];
+    if (!range) continue;
+    const n = Number(v);
+    if (!Number.isFinite(n)) continue;
+    const clamped = Math.min(range[1], Math.max(range[0], n));
+    out[k] = range[2] ? Math.round(clamped) : clamped;
+  }
+  return out;
+}
 
 const CODE_CHARS = 'ACDEFGHJKLMNPQRSTUVWXYZ23456789';
 
@@ -54,15 +103,40 @@ export class Room {
   removePlayer(id, { drop = true } = {}) {
     const np = this.players.get(id);
     if (!np) return;
-    if (drop) this.players.delete(id);
-    else np.connected = false;
-    if (this.game) this.game.players.get(id) && (this.game.players.get(id).connected = false);
-    // 转交房主
-    if (np.host) {
+    const wasHost = !!np.host;
+    if (drop) {
+      this.players.delete(id);
+      // 明确退出去的人要从模拟里摘掉：只标 connected=false 的话，他会继续被 AI 当靶子、
+      // 继续吃伤害，还会在结算里挂个空名字
+      if (this.game) this.game.removePlayer(id);
+    } else {
+      np.connected = false;
+      const gp = this.game ? this.game.players.get(id) : null;
+      if (gp) gp.connected = false;
+    }
+    // 交房主：只在真的被移除时转交，并且要把原房主的标记清掉，
+    // 否则他 60 秒内重连就会变成两个房主（都能改设置/开局）
+    if (drop && wasHost) {
+      np.host = false;
       const next = [...this.players.values()].find((p) => p.connected && p.id !== id);
       if (next) next.host = true;
     }
     if (this.players.size === 0) this.manager.removeRoom(this.code);
+  }
+
+  /**
+   * 断线重连：网络成员和对局里的玩家都要标回 connected。
+   * 只标网络侧的话，合作模式的「全员倒地」判定（game.js 里要 p.connected）会把刚回来的人漏掉，
+   * 单人局可能在重连成功的下一秒被判团灭。
+   */
+  reconnect(id, ws) {
+    const np = this.players.get(id);
+    if (!np) return false;
+    np.ws = ws;
+    np.connected = true;
+    const gp = this.game ? this.game.players.get(id) : null;
+    if (gp) gp.connected = true;
+    return true;
   }
 
   get host() {
@@ -175,10 +249,13 @@ export class Room {
     }
 
     if (this.tickCount % SNAPSHOT_EVERY === 0) {
-      for (const p of this.players.values()) {
-        if (!p.ws || p.ws.readyState !== 1) continue;
-        const snap = g.snapshot(p.id);
-        snap.t = 'snap';
+      // snapshot() 会把 this.events 清空，所以每人调一次的话只有第一个人拿得到事件
+      // （跳/命/死亡这些特效就只发给一个人）。公共部分算一次，逐人只补自己的那份。
+      const live = [...this.players.values()].filter((p) => p.ws && p.ws.readyState === 1);
+      if (!live.length) { g.clearEvents(); return; }
+      const body = g.snapshotBody();
+      for (const p of live) {
+        const snap = { ...body, t: 'snap', me: g.snapshotMe(p.id) };
         try { p.ws.send(JSON.stringify(snap)); } catch { /* ignore */ }
       }
     }
@@ -195,11 +272,7 @@ export class Room {
       case 'settings': {
         if (!np.host) return send(np.ws, { t: 'err', msg: '只有房主可以修改设置' });
         if (this.game) return send(np.ws, { t: 'err', msg: '对局中无法修改设置' });
-        const s = msg.settings || {};
-        for (const k of Object.keys(DEFAULT_SETTINGS)) {
-          if (s[k] !== undefined) this.settings[k] = s[k];
-        }
-        this.settings.maxPlayers = Math.max(1, Math.min(MAX_PLAYERS, this.settings.maxPlayers | 0));
+        this.settings = cleanSettings(msg.settings, this.settings);
         this.broadcastRoom();
         this.manager.broadcastRoomList();
         break;
@@ -274,7 +347,7 @@ export class Room {
       }
 
       case 'chat': {
-        const text = String(msg.text || '').slice(0, 160);
+        const text = cleanText(msg.text, 160);
         if (text) this.chat_(np.name, text);
         break;
       }

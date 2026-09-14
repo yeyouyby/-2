@@ -90,6 +90,7 @@ export function updateEnemy(game, e, dt) {
     if (e.vy > PHYS.maxFall) e.vy = PHYS.maxFall;
   }
   const wasGround = e.onGround;
+  const preVx = e.vx;              // 碰撞解算会改 vx，保留动量得用撞之前的值
   e.onGround = false;
   // ledge：正在往上爬的那块平台，上升时按「柱子」解算，避免斜插进平台底面被判定成天花板
   const ledge = !e.flying && e.plan ? e.plan.solid : null;
@@ -100,22 +101,29 @@ export function updateEnemy(game, e, dt) {
     if (res.ground && e.vy > 0) e.vy = 0;
     if (res.ground && !wasGround) onEnemyLand(e);
   }
-  // 差一点点就够到平台边缘 → 直接一把扒上去（卡 10 厘米比表演一段失败的抛物线好看）
+  // 差一点点就够到平台边缘 → 一把扒上去（卡 10 厘米比表演一段失败的抛物线好看）。
+  // 光抬高度不够：身体还整只在平台外侧的话，抬完照样是空的，所以要连水平位置一起挪到台面上。
   if (res.climb && !res.ground && !e.flying && e.plan && e.vy < 260) {
+    const s = e.plan.solid;
     const gap = (e.y + e.h) - e.plan.top;
-    if (gap > 0 && gap <= NAV.ledgeGrab
-      && rectFree(game.solids, { x: e.x, y: e.plan.top - e.h - 1, w: e.w, h: e.h + 1 })) {
-      e.y = e.plan.top - e.h;
-      e.vy = 0;
-      e.onGround = true;
-      onEnemyLand(e);
+    if (gap > 0 && gap <= NAV.ledgeGrab) {
+      const fromLeft = (e.x + e.w / 2) < s.x + s.w / 2;
+      const nx = fromLeft ? s.x + 2 : s.x + s.w - e.w - 2;
+      const stand = { x: nx, y: e.plan.top - e.h - 1, w: e.w, h: e.h + 1 };
+      if (nx > 0 && nx + e.w < game.level.width && rectFree(game.solids, stand)) {
+        e.x = nx;
+        e.y = e.plan.top - e.h;
+        e.vy = 0;
+        e.onGround = true;
+        onEnemyLand(e);
+      }
     }
   }
   if (res.hitX) {
-    // 记录「被挡住」，导航会据此强制起跳翻过去；空中撞墙时保留大部分动量，
-    // 不然贴着墙上不去，落地又卡在同一处反复蹭。
+    // 记录「被挡住」，导航会据此强制起跳翻过去。moveAndCollide 里已经把 vx 清零了，
+    // 所以空中要拿碰撞前的速度来保留动量，不然贴着墙上不去、落地又在同一处反复蹭。
     if (!e.flying) e.blockedT = NAV.blockedHold;
-    e.vx = e.onGround ? 0 : e.vx * 0.6;
+    e.vx = e.onGround ? 0 : preVx * 0.6;
   }
 
   // 世界边界兜底：被击退/挤到墙外、掉出场地的怪要拉回来，否则会一直往下掉
