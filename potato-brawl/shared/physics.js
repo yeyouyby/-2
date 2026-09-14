@@ -25,9 +25,19 @@ function approach(v, target, delta) {
 
 /**
  * 轴分离式移动 + 碰撞解算。body: {x,y,w,h}（x,y 为左上角）
+ *
+ * ledge（可选）：正在「往上爬」的那块平台。上升过程中如果脚还没超过平台顶面，
+ * 就把这块平台临时向下加厚成一根柱子再解算 X —— 否则角色会斜着插进平台底面，
+ * Y 轴解算把这一撞判成「顶到头」（vy 归零），二段跳白白浪费，永远爬不上平台。
+ * 玩家不需要这个（人是自己操作的，会贴着边缘卡一下再翻上去），跳平台上来的怪需要。
  */
-export function moveAndCollide(b, dx, dy, solids) {
-  const res = { hitX: false, hitY: false, ground: false, ceil: false };
+const CLIMB_EXT = 400;
+
+export function moveAndCollide(b, dx, dy, solids, ledge) {
+  const res = { hitX: false, hitY: false, ground: false, ceil: false, climb: false };
+  const climb = ledge && dy < 0 && b.y + b.h > ledge.y + 0.5
+    ? { x: ledge.x, y: ledge.y, w: ledge.w, h: ledge.h + CLIMB_EXT }
+    : null;
   b.x += dx;
   for (let i = 0; i < solids.length; i++) {
     const s = solids[i];
@@ -36,6 +46,16 @@ export function moveAndCollide(b, dx, dy, solids) {
     else if (dx < 0) b.x = s.x + s.w;
     b.vx = 0;
     res.hitX = true;
+  }
+  if (climb) {
+    // 只拦「这一 tick 从侧面挤进柱子」的情况（上一 tick 还整只在这块平台的左/右侧外面）。
+    // 已经在平台正下方时不做修正，否则会被瞬移式推出去。
+    const px = b.x - dx;
+    if (dx > 0 && px + b.w <= climb.x + 0.01 && b.x + b.w > climb.x) {
+      b.x = climb.x - b.w; res.climb = true;          // 不清 vx：贴着平台边缘往上蹭，翻过去那一下还要靠这个速度
+    } else if (dx < 0 && px >= climb.x + climb.w - 0.01 && b.x < climb.x + climb.w) {
+      b.x = climb.x + climb.w; res.climb = true;
+    }
   }
   b.y += dy;
   for (let i = 0; i < solids.length; i++) {
@@ -142,6 +162,39 @@ export function stepActor(a, input, dt, solids, o = {}) {
   if (a.y > H + 200) { a.y = H - a.h; a.vy = 0; }
 
   return out;
+}
+
+// ---------------------------------------------------------------- 平台导航小工具
+// 敌人 AI 用它判断「能不能跳上这块平台」「站在某个点会不会卡头」，
+// 客户端预览/测试也可以复用，所以放在 shared 里。
+
+export function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+/** 某个矩形是否不与任何实心块重叠（站立净空检查） */
+export function rectFree(solids, r) {
+  for (let i = 0; i < solids.length; i++) if (aabb(r, solids[i])) return false;
+  return true;
+}
+
+/** 以初速度 v 起跳能上升的最大高度（忽略空气阻力，v²/2g） */
+export function apexRise(v, gravity = PHYS.gravity) {
+  return (v * v) / (2 * gravity);
+}
+
+/**
+ * 找到实体脚下踩着的实心块（用于判断「我们是否站在同一块平台上」）。
+ * 返回该实心块，或 null（例如站在地板上时返回地板）。
+ */
+export function supportUnder(solids, e, tol = 2) {
+  const feet = e.y + e.h;
+  let best = null;
+  for (let i = 0; i < solids.length; i++) {
+    const s = solids[i];
+    if (s.y < feet - tol || s.y > feet + 40) continue;   // 必须在脚下附近
+    if (e.x + e.w <= s.x + 1 || e.x >= s.x + s.w - 1) continue; // 水平没重叠
+    if (!best || s.y < best.y) best = s;                 // 取最高的一块
+  }
+  return best;
 }
 
 /** 命中矩形：近战挥击范围 */

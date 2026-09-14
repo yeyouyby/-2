@@ -1,12 +1,16 @@
 // 敌人数值表（前后端共享：客户端需要体型/颜色/名字来渲染）
+// jump = 跳跃能力（跳上平台追人用，逻辑见 server/src/game/nav.js）：
+//   mul   相对玩家跳跃力的倍率（1 = 和玩家跳一样高）
+//   jumps 最多几段跳（2 = 会二段跳）
+// 地面怪都给了二段跳，否则玩家往平台上一站就变成绝对安全点了。
 export const ENEMY_DEFS = {
-  slime: { name: '史莱姆', w: 30, h: 30, hp: 34, speed: 88, dmg: 9, xp: 3, color: '#7bd389', ai: 'hop', kbResist: 0 },
-  rusher: { name: '疯跑鸡', w: 26, h: 38, hp: 28, speed: 215, dmg: 11, xp: 4, color: '#ff8787', ai: 'rush', kbResist: 0 },
+  slime: { name: '史莱姆', w: 30, h: 30, hp: 34, speed: 88, dmg: 9, xp: 3, color: '#7bd389', ai: 'hop', kbResist: 0, jump: { mul: 1.06, jumps: 2 } },
+  rusher: { name: '疯跑鸡', w: 26, h: 38, hp: 28, speed: 215, dmg: 11, xp: 4, color: '#ff8787', ai: 'rush', kbResist: 0, jump: { mul: 1.02, jumps: 2 } },
   flyer: { name: '飞虫', w: 30, h: 22, hp: 24, speed: 165, dmg: 8, xp: 4, color: '#a5d8ff', ai: 'fly', flying: true, kbResist: 0.2 },
-  shooter: { name: '射手菌', w: 28, h: 40, hp: 40, speed: 72, dmg: 10, xp: 5, color: '#ffd43b', ai: 'shoot', kbResist: 0 },
-  tank: { name: '石头人', w: 46, h: 50, hp: 190, speed: 60, dmg: 22, xp: 9, color: '#adb5bd', ai: 'tank', kbResist: 0.65 },
-  bomber: { name: '炸弹怪', w: 28, h: 28, hp: 32, speed: 140, dmg: 28, xp: 6, color: '#ff6b6b', ai: 'bomb', kbResist: 0 },
-  boss: { name: '土豆王', w: 78, h: 88, hp: 1300, speed: 85, dmg: 26, xp: 80, color: '#e8b04b', ai: 'boss', boss: true, kbResist: 0.95 },
+  shooter: { name: '射手菌', w: 28, h: 40, hp: 40, speed: 72, dmg: 10, xp: 5, color: '#ffd43b', ai: 'shoot', kbResist: 0, jump: { mul: 1.0, jumps: 2 } },
+  tank: { name: '石头人', w: 46, h: 50, hp: 190, speed: 60, dmg: 22, xp: 9, color: '#adb5bd', ai: 'tank', kbResist: 0.65, jump: { mul: 1.0, jumps: 2 } },
+  bomber: { name: '炸弹怪', w: 28, h: 28, hp: 32, speed: 140, dmg: 28, xp: 6, color: '#ff6b6b', ai: 'bomb', kbResist: 0, jump: { mul: 1.04, jumps: 2 } },
+  boss: { name: '土豆王', w: 78, h: 88, hp: 1300, speed: 85, dmg: 26, xp: 80, color: '#e8b04b', ai: 'boss', boss: true, kbResist: 0.95, jump: { mul: 1.06, jumps: 2 } },
 };
 
 // 每波解锁的敌人种类

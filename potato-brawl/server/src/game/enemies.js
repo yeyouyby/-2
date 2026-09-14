@@ -1,7 +1,8 @@
 // 敌人 AI（纯服务器端；数值表在 shared/enemies.js，客户端渲染也要用）
 import { PHYS } from '../../../shared/constants.js';
 import { ENEMY_DEFS } from '../../../shared/enemies.js';
-import { aabb, centerOf, dist2, moveAndCollide } from '../../../shared/physics.js';
+import { aabb, centerOf, dist2, moveAndCollide, rectFree } from '../../../shared/physics.js';
+import { NAV, navAct, navThink, onEnemyLand } from './nav.js';
 
 export { ENEMY_DEFS };
 
@@ -29,6 +30,10 @@ export function createEnemy(game, type, x, y, wave = 1, opts = {}) {
     hitFlash: 0, stun: 0, dead: false,
     spawnGrace: 0.35,
     phase: 0,
+    // 平台追踪用的跳跃状态（见 server/src/game/nav.js）
+    jump: def.jump || null,
+    jumps: 0, jumpCd: 0, blockedT: 0, planAge: 0, navJump: 0,
+    plan: null, steerX: null, airChaseT: 0,
   };
   e.hp = e.maxHp;
   e.coins = Math.max(1, Math.round((type === 'boss' ? 60 : 2 + e.xp * 0.6) * (elite ? 2.5 : 1)));
@@ -47,6 +52,13 @@ export function updateEnemy(game, e, dt) {
   const target = game.nearestAlivePlayer(e.x + e.w / 2, e.y + e.h / 2, 2600);
   e.target = target;
 
+  // ---- 平台追踪：先决定走位（去起跳点），AI 之后再由 navAct 真正起跳 ----
+  // busy = 技能/引信期间不接管移动，免得把冲锋、跳劈的节奏搞乱
+  const busy = (e.ai === 'boss' && e.phase !== 0) || (e.ai === 'bomb' && e.phase === 1);
+  const chasing = e.stun <= 0 && !e.flying && !!target && !busy;
+  e.steerX = chasing ? navThink(game, e, target, dt).steerX : null;
+  if (!chasing) { e.plan = null; e.navJump = 0; }
+
   if (e.stun <= 0) {
     switch (e.ai) {
       case 'hop': aiHop(game, e, target, dt); break;
@@ -61,18 +73,56 @@ export function updateEnemy(game, e, dt) {
     e.vx *= 0.9;
   }
 
+  // ---- 起跳 / 二段跳（放在 AI 之后，才不会覆盖 AI 刚算好的水平方向）----
+  if (chasing) {
+    const act = navAct(e);
+    if (act.jumped) {
+      game.addEvent({
+        t: act.double ? 'edouble' : 'jump',
+        x: e.x + e.w / 2, y: e.y + e.h, f: e.facing,
+      });
+    }
+  }
+
   // 物理
   if (!e.flying) {
     e.vy += PHYS.gravity * dt;
     if (e.vy > PHYS.maxFall) e.vy = PHYS.maxFall;
   }
+  const wasGround = e.onGround;
   e.onGround = false;
-  const res = moveAndCollide(e, e.vx * dt, e.vy * dt, game.solids);
+  // ledge：正在往上爬的那块平台，上升时按「柱子」解算，避免斜插进平台底面被判定成天花板
+  const ledge = !e.flying && e.plan ? e.plan.solid : null;
+  const res = moveAndCollide(e, e.vx * dt, e.vy * dt, game.solids, ledge);
   if (!e.flying) {
     e.onGround = res.ground;
+    if (res.ground) e.jumps = 0;      // 落地就重置段跳数（不依赖导航是否执行）
     if (res.ground && e.vy > 0) e.vy = 0;
+    if (res.ground && !wasGround) onEnemyLand(e);
   }
-  if (res.hitX) e.vx = 0;
+  // 差一点点就够到平台边缘 → 直接一把扒上去（卡 10 厘米比表演一段失败的抛物线好看）
+  if (res.climb && !res.ground && !e.flying && e.plan && e.vy < 260) {
+    const gap = (e.y + e.h) - e.plan.top;
+    if (gap > 0 && gap <= NAV.ledgeGrab
+      && rectFree(game.solids, { x: e.x, y: e.plan.top - e.h - 1, w: e.w, h: e.h + 1 })) {
+      e.y = e.plan.top - e.h;
+      e.vy = 0;
+      e.onGround = true;
+      onEnemyLand(e);
+    }
+  }
+  if (res.hitX) {
+    // 记录「被挡住」，导航会据此强制起跳翻过去；空中撞墙时保留大部分动量，
+    // 不然贴着墙上不去，落地又卡在同一处反复蹭。
+    if (!e.flying) e.blockedT = NAV.blockedHold;
+    e.vx = e.onGround ? 0 : e.vx * 0.6;
+  }
+
+  // 世界边界兜底：被击退/挤到墙外、掉出场地的怪要拉回来，否则会一直往下掉
+  const WW = game.level.width, WH = game.level.height;
+  if (e.x < 0) { e.x = 0; if (e.vx < 0) e.vx = 0; }
+  if (e.x + e.w > WW) { e.x = WW - e.w; if (e.vx > 0) e.vx = 0; }
+  if (e.y > WH + 240) { e.y = (game.solids[0] ? game.solids[0].y : WH) - e.h - 2; e.vy = 0; e.plan = null; e.jumpCd = 0.3; }
 
   // 接触伤害
   if (target && e.attackCd <= 0) {
@@ -90,19 +140,26 @@ export function updateEnemy(game, e, dt) {
 }
 
 function stepToward(e, tx, speed, dt, accel = 1500) {
+  // 导航给出的走位目标优先（绕到起跳点 / 空中收拢到落点）
+  if (e.steerX != null) tx = e.steerX;
   const dir = Math.sign(tx - (e.x + e.w / 2)) || 1;
   e.facing = dir;
   e.vx += dir * accel * dt;
-  const max = speed;
+  // 追平台的那一跳允许稍微超一点地面移速，否则弧线永远差几十厘米够不着边缘
+  const max = e.airChaseT > 0 ? speed * NAV.airChaseMul : speed;
   if (Math.abs(e.vx) > max) e.vx = dir * max;
 }
 
 function aiHop(game, e, target, dt) {
   if (!target) { e.vx *= 0.9; return; }
   stepToward(e, target.x + target.w / 2, e.speed, dt);
-  if (e.timer > 1.5 && e.onGround) {
+  // 史莱姆的招牌连蹦：只在没有「跳平台计划」要执行时插空来一下，
+  // 免得和导航抢起跳时机（导航跳完会把 onGround 置空，这里自然不会重复触发）
+  if (e.timer > 1.4 && e.onGround && e.jumps === 0 && e.jumpCd <= 0 && !e.plan) {
     e.timer = 0;
     e.vy = -560;
+    e.jumps = 1;
+    e.jumpCd = 0.1;
     e.vx *= 1.25;
   }
 }
@@ -112,12 +169,15 @@ function aiRush(game, e, target, dt) {
   const tc = centerOf(target), ec = centerOf(e);
   const d2 = dist2(ec.x, ec.y, tc.x, tc.y);
   if (d2 < 260 * 260 && e.abilityCd <= 0) {
-    // 冲刺
+    // 冲刺：导航想跳上平台时，把冲刺的瞄准点改成起跳点/落点，别一头撞在平台侧面上
+    const aimX = e.steerX != null ? e.steerX : tc.x;
+    const aimY = e.plan && e.plan.top < tc.y ? e.plan.top + 8 : tc.y;
     e.abilityCd = 1.6;
-    const dx = tc.x - ec.x, dy = tc.y - ec.y;
+    const dx = aimX - ec.x, dy = aimY - ec.y;
     const len = Math.hypot(dx, dy) || 1;
     e.vx = (dx / len) * 620;
     e.vy = (dy / len) * 420 - 120;
+    e.jumps = Math.max(1, e.jumps);   // 这段冲程当成「已经用掉一跳」，二段跳留给空中修正
     e.stun = 0.08;
     game.addEvent({ t: 'rush', x: ec.x, y: ec.y });
     return;

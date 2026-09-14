@@ -203,6 +203,13 @@ export class GameClient {
         if (e.id === this.myId) this.audio.jump();
         this.sparks(e.x, e.y, 3, '#e8d5b7');
         break;
+      case 'edouble':
+        // 怪物二段跳上平台：脚下顶一圈尘土，让玩家一眼看出「它追上来了」
+        if (this.particles.length < MAX_PARTICLES) {
+          this.particles.push({ type: 'ring', x: e.x, y: e.y, r: 20, life: 0.3, max: 0.3, size: 4, color: '#e8d5b7' });
+        }
+        this.sparks(e.x, e.y, 5, '#d9c9ae');
+        break;
       case 'dash':
         if (e.id === this.myId) this.audio.dash();
         for (let i = 0; i < 6; i++) {

@@ -1,0 +1,4 @@
+# 依赖目录（压缩包里已内置，不用提交进 git）
+node_modules/
+npm-debug.log*
+.DS_Store
