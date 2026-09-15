@@ -1,0 +1,29 @@
+{
+  "name": "potato-brawl",
+  "version": "1.0.0",
+  "description": "局域网联机 2D 横版动作 Roguelite —— 《土豆兄弟·横版》(Potato Brawl)。权威服务器 + WebSocket，支持合作 PvE 与 PvP 对战。",
+  "type": "module",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node --watch server/index.js",
+    "test": "node test/headless-test.js",
+    "test:jump": "node test/enemy-jump-test.js",
+    "test:safety": "node test/net-safety-test.js",
+    "lan": "node server/index.js --host 0.0.0.0 --port 3000",
+    "backup": "node tools/data-cli.js export",
+    "restore": "node tools/data-cli.js import",
+    "data": "node tools/data-cli.js list",
+    "test:account": "node test/account-save-test.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "playwright": "^1.49.1"
+  }
+}
