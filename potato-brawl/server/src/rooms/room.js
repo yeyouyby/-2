@@ -363,6 +363,7 @@ export class Room {
         this.overTimer = 90; // 90 秒后自动回到大厅
         this.broadcast({ t: 'over', result: g.result });
         this.recordResults(g.result);
+        this.store && this.store.flush();     // 一局结束的战绩/最后一波的检查点，立刻落盘
       }
       this.overTimer -= dt;
       if (this.overTimer <= 0) { this.backToLobby(); return; }
@@ -480,6 +481,7 @@ export class Room {
         if (!np.host) return send(np.ws, { t: 'err', msg: '只有房主能手动存档' });
         const r = this.checkpoint();
         if (r.error) return send(np.ws, { t: 'err', msg: r.error });
+        this.store.flush();     // 手存就是给人一个「现在真的在盘上了」的确定感，不等 debounce
         this.chat_('系统', `已存到检查点：第 ${this.game.wave + 1} 波前（${r.save.id}）`, true);
         send(np.ws, { t: 'saved', id: r.save.id, wave: this.game.wave + 1 });
         send(np.ws, { t: 'saveList', saves: this.listSavesFor(np) });
