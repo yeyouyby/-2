@@ -173,7 +173,8 @@ export class UI {
   }
 
   onSaved(m) {
-    this.toast(`已写检查点：第 ${m.wave} 波前${m.auto ? '（自动）' : ''}`);
+    // label 是服务端按「商店 / 波中」算出来的说法，自己拼会把「本波重打」显示成「下一波前」
+    this.toast(`已写检查点：${m.label || `第 ${m.wave} 波前`}${m.auto ? '（自动）' : ''}`);
     if (m.id) this.net.send({ t: 'saves' });
   }
 

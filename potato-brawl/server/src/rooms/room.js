@@ -370,7 +370,7 @@ export class Room {
       this.lastCheckpointTag = `p${g.wave}`;
       if (this.autoSaveOn()) {
         const r = this.checkpoint();
-        if (r.ok) this.broadcast({ t: 'saved', id: r.save.id, wave: g.wave + 1, auto: true });
+        if (r.ok) this.broadcast({ t: 'saved', id: r.save.id, wave: g.wave + 1, label: r.save.label, auto: true });
         else if (r.error && this.players.size && g.wave > 0) this.chat_('系统', '自动存档没写成：' + r.error, true);
       }
     }
@@ -498,10 +498,15 @@ export class Room {
         if (!np.host) return send(np.ws, { t: 'err', msg: '只有房主能手动存档' });
         const r = this.checkpoint();
         if (r.error) return send(np.ws, { t: 'err', msg: r.error });
-        this.store.flush();     // 手存就是给人一个「现在真的在盘上了」的确定感，不等 debounce
-        this.chat_('系统', `已存到检查点：第 ${this.game.wave + 1} 波前（${r.save.id}）`, true);
-        send(np.ws, { t: 'saved', id: r.save.id, wave: this.game.wave + 1 });
+        // 回执直接用检查点自己的 label：波中手存是「第 N 波（本波重打）」，硬说成「第 N+1 波前」会骗人
+        this.chat_('系统', `已存到检查点：${r.save.label}（${r.save.id}）`, true);
+        send(np.ws, { t: 'saved', id: r.save.id, wave: r.save.wave + 1, label: r.save.label });
         send(np.ws, { t: 'saveList', saves: this.listSavesFor(np) });
+        // 手存给人「已经在盘上了」的确定感：等这次写盘落地，不等 debounce；
+        // 写失败要说出来 —— 进度还在内存里、会自动重试，但别让人以为已经安全了
+        this.store.flush().then((res) => {
+          if (res && res.ok === false) send(np.ws, { t: 'err', msg: '存档写盘失败（盘满 / 目录被占用），进度还在内存里，服务器会重试' });
+        }).catch(() => {});
         break;
       }
 
