@@ -505,7 +505,10 @@ export class Room {
         // 手存给人「已经在盘上了」的确定感：等这次写盘落地，不等 debounce；
         // 写失败要说出来 —— 进度还在内存里、会自动重试，但别让人以为已经安全了
         this.store.flush().then((res) => {
-          if (res && res.ok === false) send(np.ws, { t: 'err', msg: '存档写盘失败（盘满 / 目录被占用），进度还在内存里，服务器会重试' });
+          // 只看「saves 这一份」有没有落盘：账号文件写失败（例如 data/ 满了以外的权限问题）
+          // 不该让房主以为存档没保住
+          const bad = res && res.ok === false && (res.failed || []).includes('saves');
+          if (bad) send(np.ws, { t: 'err', msg: '存档写盘失败（盘满 / 目录被占用），进度还在内存里，服务器会重试' });
         }).catch(() => {});
         break;
       }

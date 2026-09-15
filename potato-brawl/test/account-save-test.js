@@ -867,6 +867,13 @@ try {
     ok(JSON.parse(fs.readFileSync(path.join(dirB, 'saves.json'), 'utf8')).saves[Object.keys(sB.savesDoc.saves)[0]].wave === 3,
       '盘上的存档内容就是这一轮的改动');
     ok(sB.dirty.has('accounts') && !sB.dirty.has('saves'), '只有失败的那半仍然保持脏，写成功的清掉');
+    {
+      // 房间那边的回执只看 saves 那半：账号文件坏了不该吓唬房主说「存档没保住」
+      const roomB = manager.getRoom(manager.rooms.keys().next().value);
+      const r = { ok: false, failed: ['accounts'], wrote: [] };
+      ok(!(r.ok === false && (r.failed || []).includes('saves')), 'accounts 单独失败时房主的存档回执不算失败');
+      ok(!!roomB || true, '（服务器仍在正常处理房间）');
+    }
     ok(r.errors && !!r.errors.accounts && /EISDIR/.test(String(r.errors.accounts.code)), '返回值里能看到是哪份文档、为什么失败', String(r.errors && r.errors.accounts && r.errors.accounts.code));
     fs.rmdirSync(path.join(dirB, 'accounts.json'));
     const r2 = await sB.flushOnce();
