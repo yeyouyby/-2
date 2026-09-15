@@ -19,15 +19,23 @@ const { server, manager, store, adminKey } = createServer({
 });
 
 if (store && !store.acquireLock()) {
+  const busy = store.lockError === 'busy';
+  const who = busy && store.lockBusy ? `（占用者 pid ${store.lockBusy.pid}）` : `（原因：${store.lockError || 'unknown'}）`;
   // 只是警告的话，第二个服务器照样跑起来跟第一个抢同一批 JSON（还会在退出时把对方的锁删掉）
   if (!process.argv.includes('--force-data')) {
-    console.error('\n  ❌ 这个数据目录已经被另一个服务器进程占着：');
+    console.error(busy ? `\n  ❌ 这个数据目录已经被另一个服务器进程占着 ${who}：`
+                       : `\n  ❌ 拿不到数据目录的独占锁 ${who}：`);
     console.error(`     ${store.dir}`);
-    console.error('     同一个目录跑两个实例会把账号/存档写坏。');
-    console.error('     先关掉另一个，或者 --data-dir <别的目录> 分开数据；--force-data 可以强行启动（自担风险）。\n');
+    if (busy) {
+      console.error('     同一个目录跑两个实例会把账号/存档写坏。');
+      console.error('     先关掉另一个，或者 --data-dir <别的目录> 分开数据；--force-data 可以强行启动（自担风险）。\n');
+    } else {
+      console.error('     连 .lock 都写不了，账号/存档大概率也写不了（盘满？目录只读？被安全软件拦了？）。');
+      console.error('     修好再启动；确认没问题只是想试可以加 --force-data。\n');
+    }
     process.exit(1);
   }
-  console.warn('\n  ⚠️ --force-data：明知 data/.lock 被别的实例占着还继续跑，两份数据可能互相覆盖。\n');
+  console.warn('\n  ⚠️ --force-data：数据目录的独占锁没拿到还继续跑，两份数据可能互相覆盖 / 写了也白写。\n');
 }
 
 server.listen(PORT, HOST, () => {

@@ -19,7 +19,7 @@ import http from 'node:http';
 import { execFileSync } from 'node:child_process';
 import WebSocket from 'ws';
 
-import { JsonStore, MAX_ACCOUNTS, MAX_SAVES } from '../server/src/data/store.js';
+import { JsonStore, MAX_ACCOUNTS, MAX_SAVES, safeId } from '../server/src/data/store.js';
 import { AccountService, publicView, validUser } from '../server/src/data/accounts.js';
 import { applyCheckpoint, checkpointOf, saveSummary } from '../server/src/data/saves.js';
 import { Game } from '../server/src/game/game.js';
@@ -727,6 +727,125 @@ try {
     await store.flush();
     const nameOnDisk = JSON.parse(fs.readFileSync(path.join(dataDir, 'accounts.json'), 'utf8')).accounts.hero.name;
     ok(nameOnDisk === '导入后又改', '写进的是新对象而不是被替换掉的孤儿（磁盘上能看到）', nameOnDisk);
+  }
+
+  // ============================================================
+  console.log('\n[13] 第三轮 review：锁的原子性 / 写盘期间的改动 / 特殊 map key / 导入的落盘确认');
+
+  // ---- 锁：抢不到就不认领，写不了也不认领，僵死的能接管 ----
+  {
+    const dirK = tmp('lockown');
+    const K1 = new JsonStore(dirK).loadSync();
+    ok(K1.acquireLock() === true && K1.lockOwned === true, '第一个实例用 O_EXCL 建锁成功');
+    const K2 = new JsonStore(dirK).loadSync();
+    ok(K2.acquireLock() === false && K2.lockOwned === false && K2.lockError === 'busy',
+      '第二个实例被拒绝，而且不会「顺便」认领这把锁', JSON.stringify([K2.lockOwned, K2.lockError]));
+    ok(K1.readLock().id === K1.lockId, '被拒绝的一方不会把别人的锁内容覆盖掉');
+    K2.releaseLock();
+    ok(fs.existsSync(path.join(dirK, '.lock')), '非持锁者照样删不掉锁');
+
+    const dirRO = tmp('locknowrite');
+    fs.mkdirSync(path.join(dirRO, '.lock'));                    // open('wx') / unlink 都会失败
+    const K3 = new JsonStore(dirRO).loadSync();
+    ok(K3.acquireLock() === false && K3.lockOwned === false && K3.lockError !== 'busy' && !!K3.lockError,
+      '锁文件写不出来（只读目录 / 盘满 / 被占）时也不能当成「已持锁」', String(K3.lockError));
+    K3.releaseLock();
+    ok(fs.existsSync(path.join(dirRO, '.lock')), '而且不会把挡路的东西删掉');
+
+    const dirDead = tmp('lockdead');
+    fs.mkdirSync(dirDead, { recursive: true });
+    fs.writeFileSync(path.join(dirDead, '.lock'), '99999999 deadbeef\n');
+    const K4 = new JsonStore(dirDead).loadSync();
+    ok(K4.acquireLock() === true && K4.readLock().id === K4.lockId, '僵死锁（pid 早没了）会被接管');
+    K4.releaseLock();
+    ok(!fs.existsSync(path.join(dirDead, '.lock')), '接管之后退出照样释放干净');
+    for (const d of [dirK, dirRO, dirDead]) fs.rmSync(d, { recursive: true, force: true });
+  }
+
+  // ---- flush 途中又改了数据：必须仍然算脏，并写进下一轮 ----
+  {
+    const dirG = tmp('genflush');
+    const sG = new JsonStore(dirG).loadSync();
+    sG.closed = true;                                            // 不让后台定时器插一脚
+    sG.putAccount({ user: 'racer', pass: 'abcd', name: '第一版' });
+    const realWrite = sG.writeText.bind(sG);
+    let gate = null;
+    sG.writeText = (file, text) => new Promise((resolve) => { gate = () => realWrite(file, text).then(resolve); });
+    const pending = sG.flushOnce();
+    for (let i = 0; i < 400 && !gate; i++) await new Promise((r) => setTimeout(r, 2));   // 等它走进 await 里
+    sG.putAccount({ user: 'racer', pass: 'abcd', name: '第二版' });   // 就卡在这一瞬间改数据
+    gate();
+    const r = await pending;
+    sG.writeText = realWrite;                 // 放行下一轮：恢复成真写
+    ok(r.ok && r.wrote.includes('accounts') && sG.dirty.has('accounts'),
+      '写完发现「期间还有新改动」→ 脏标记保留，不会把新改动标成已保存', JSON.stringify([r.wrote, [...sG.dirty]]));
+    await sG.flushOnce();
+    const diskName = JSON.parse(fs.readFileSync(path.join(dirG, 'accounts.json'), 'utf8')).accounts.racer.name;
+    ok(diskName === '第二版' && !sG.dirty.has('accounts'), '下一轮把新改动落盘了（重启不会退回第一版）', diskName);
+    // 序列化本身要在 await 之前完成：不能把「改了一半的文档」写出去
+    sG.putAccount({ user: 'snapshotme', pass: 'abcd', name: 'A' });
+    let seen = '';
+    sG.writeText = async (file, text) => { seen = text; return realWrite(file, text); };
+    await sG.flushOnce();
+    sG.putAccount({ user: 'snapshotme', pass: 'abcd', name: 'B' });
+    ok(/"name": "A"/.test(seen) && JSON.parse(seen).accounts.snapshotme.name === 'A',
+      '落盘用的是写盘那一刻的快照字符串，不是活对象的引用');
+    fs.rmSync(dirG, { recursive: true, force: true });
+  }
+
+  // ---- __proto__ / constructor 这类 key 进不了任何一张表 ----
+  {
+    const dirP = tmp('protokey');
+    fs.writeFileSync(path.join(dirP, 'saves.json'), JSON.stringify({ v: 1, saves: { ok1: { wave: 2, owners: ['x'], players: [] } } }));
+    const sP = new JsonStore(dirP).loadSync();
+    ok(sP.getSave('constructor') === null && sP.getSave('toString') === null && sP.getSave('hasOwnProperty') === null,
+      '按 id 取存档不会顺着原型链拿到方法（getSave("constructor") 不返回函数）');
+    const made = sP.putSave({ id: '__proto__', wave: 3, owners: ['x'], players: [] });
+    ok(made.id !== '__proto__' && safeId(made.id), 'putSave 收到特殊 id 会自动换发合法的', made.id);
+    ok(sP.saveCount() === 2 && Object.getPrototypeOf(sP.savesDoc.saves) === Object.prototype, 'map 的原型没被动过');
+    sP.deleteSave('constructor');
+    ok(sP.saveCount() === 2, 'deleteSave("constructor") 不会把别人的东西删掉');
+
+    const dirQ = tmp('protoimp');
+    const sQ = new JsonStore(dirQ).loadSync();
+    const weirdAcc = {};
+    Object.defineProperty(weirdAcc, '__proto__', { value: { user: '__proto__', pass: 'abcd' }, enumerable: true, writable: true, configurable: true });
+    const imp = sQ.importBundle({
+      kind: 'potato-brawl-backup', v: 1, accounts: weirdAcc,
+      saves: [{ id: '__proto__', wave: 1, players: [] }, { id: 'k1', wave: 1, players: [] }],
+    }, { merge: true });
+    ok(imp.accounts === 0 && imp.saves === 1 && imp.skipped === 2, '导入时特殊 key 一律跳过并计入 skipped', JSON.stringify(imp));
+    ok(sQ.accountCount() === 0 && sQ.saveCount() === 1 && ({}).wave === undefined && ({}).pass === undefined,
+      '没有污染原型，也没有凭空多出可用记录', JSON.stringify([sQ.accountCount(), sQ.saveCount()]));
+    const accQ = new AccountService(sQ);
+    ok(/内部属性重名/.test(accQ.register({ user: '__proto__', pass: 'abcd', name: 'x' }).error || ''),
+      '这种用户名直接不让注册（而不是「注册成功、重启后凭空消失」）');
+    await sQ.close();
+    fs.rmSync(dirP, { recursive: true, force: true });
+    fs.rmSync(dirQ, { recursive: true, force: true });
+  }
+
+  // ---- 管理页导入：落盘失败就不能说成功 ----
+  {
+    const accFile = path.join(dataDir, 'accounts.json');
+    const bak = fs.readFileSync(accFile, 'utf8');
+    fs.rmSync(accFile);
+    fs.mkdirSync(accFile);                              // rename 到目录上必失败
+    const bundle = JSON.parse(JSON.stringify(store.exportBundle()));
+    bundle.accounts.proto_probe = { user: 'proto_probe', pass: 'abcd', name: '探针', session: '', prefs: {}, stats: {}, saves: [] };
+    const bad = await api('POST', '/admin/import?merge=1', JSON.stringify(bundle), 'test-admin-key');
+    const badJson = JSON.parse(bad.body);
+    ok(bad.status === 500 && badJson.ok === false && badJson.writtenToDisk === false && /没能写进磁盘/.test(badJson.error),
+      '写盘失败 → 500 + writtenToDisk:false（不再回 200 说「还原完成」）', `${bad.status} ${bad.body.replace(/\s+/g, ' ').slice(0, 110)}`);
+    ok(!!store.getAccount('proto_probe') && (badJson.imported && badJson.imported.accounts >= 1),
+      '但内存里确实导入了（错误信息说清「只在内存、重启会退回旧数据」）');
+    fs.rmdirSync(accFile);
+    fs.writeFileSync(accFile, bak);                     // 清障，并把原文件放回原位（内容随后会被 flush 覆盖）
+    const fix = await api('POST', '/admin/flush', '', 'test-admin-key');
+    ok(fix.status === 200 && JSON.parse(fix.body).ok === true, '障碍清掉后「强制落盘」成功', fix.body.replace(/\s+/g, ' ').slice(0, 90));
+    ok(!!JSON.parse(fs.readFileSync(accFile, 'utf8')).accounts.proto_probe, '这时候盘上才是导入后的数据');
+    const okImport = await api('POST', '/admin/import?merge=1', JSON.stringify(bundle), 'test-admin-key');
+    ok(okImport.status === 200 && JSON.parse(okImport.body).writtenToDisk === true, '正常导入仍然 200 且明确写盘成功', okImport.body.replace(/\s+/g, ' ').slice(0, 90));
   }
 
   a.close();

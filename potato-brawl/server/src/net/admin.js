@@ -158,15 +158,38 @@ export function makeAdminHandler({ store, key, manager, afterImport = null }) {
       let result;
       try { result = store.importBundle(doc, { merge: url.searchParams.get('merge') === '1' }); }
       catch (e) { json(res, 400, { error: e.message, rollback: savedAs }); return true; }
-      await store.flush();
+      // flush 的返回值必须看：写不进去（盘满 / 权限 / 文件被占用）时内存已经是新数据、
+      // 盘上还是旧数据，重启就悄悄回滚了。这时候不能回 200 说「还原完成」
+      const flushed = await store.flush().catch((e) => ({ ok: false, error: e }));
+      const onDisk = !flushed || flushed.ok !== false;
       // 账号文档被整份换掉了：在线连接手里那份对象已经是孤儿，继续改资料/记战绩会写进
       // 一个没人引用的对象（看着成功，其实丢了）—— 让服务器按用户名重新绑一次
       let rebound = null;
       if (afterImport) { try { rebound = afterImport(); } catch (e) { rebound = { error: String(e && e.message) }; } }
-      json(res, 200, { ok: true, imported: result, rollback: savedAs || null, sessions: rebound });
+      if (!onDisk) {
+        const why = (flushed && flushed.error && (flushed.error.code || flushed.error.message)) || '未知错误';
+        json(res, 500, {
+          ok: false,
+          writtenToDisk: false,
+          error: `导入已在内存里生效，但没能写进磁盘（${why}）：现在重启会退回旧数据。`
+            + `清掉盘满/权限问题后再点一次「强制落盘」，或先导出当前状态自己留一份`,
+          imported: result, rollback: savedAs || null, sessions: rebound, failed: (flushed && flushed.failed) || [],
+        });
+        return true;
+      }
+      json(res, 200, { ok: true, writtenToDisk: true, imported: result, rollback: savedAs || null, sessions: rebound });
       return true;
     }
-    if (p === '/admin/flush') { await store.flush(); json(res, 200, { ok: true }); return true; }
+    if (p === '/admin/flush') {
+      const r = await store.flush().catch((e) => ({ ok: false, error: e }));
+      const okFlush = !r || r.ok !== false;
+      json(res, okFlush ? 200 : 500, {
+        ok: okFlush,
+        wrote: (r && r.wrote) || [],
+        error: okFlush ? null : String((r && r.error && (r.error.code || r.error.message)) || '写入失败'),
+      });
+      return true;
+    }
     json(res, 404, { error: 'no such admin route' });
     return true;
   };

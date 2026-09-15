@@ -4,7 +4,7 @@
 // 真要放公网，只需要改两处：register() 里存 hash、login()/changePassword() 里比 hash
 // ——用 node:crypto 的 scryptSync 就行，其它逻辑（会话、锁定、战绩）都不用动。
 import crypto from 'node:crypto';
-import { MAX_ACCOUNTS, sanitizeAccount } from './store.js';
+import { MAX_ACCOUNTS, reservedKey, sanitizeAccount } from './store.js';
 
 const USER_RE = /^[0-9A-Za-z_\u4e00-\u9fa5]{2,20}$/;
 const PASS_MIN = 4;
@@ -12,9 +12,12 @@ const PASS_MAX = 64;
 const LOCK_AFTER = 8;          // 连错这么多次就先锁一会儿，免得有人在局域网里慢慢字典试
 const LOCK_SEC = 60;
 
-export function validUser(u) {
+export function validUser(u) {   // 返回错误文案，null 表示可用
   const s = String(u || '');
   if (!USER_RE.test(s)) return '用户名要 2-20 个字符，只能是中文、字母、数字或下划线';
+  // __proto__ / constructor 这类名字在 JS 对象里不是普通 key：存进去会去改原型，
+  // 写进 accounts.json 再读回来还会「看着在但取不出」。这种用户名直接不让注册。
+  if (reservedKey(s)) return '这个用户名和 JS 内部属性重名，换一个';
   return null;
 }
 export function validPass(p) {
@@ -72,6 +75,7 @@ export class AccountService {
       createdAt: Date.now(),
       lastLoginAt: Date.now(),
     }));
+    if (!acc) return { error: '这个用户名不可用，换一个' };     // putAccount 会拒绝 __proto__ 这类特殊 key
     return { ok: true, account: acc };
   }
 

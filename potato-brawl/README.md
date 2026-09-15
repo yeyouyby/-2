@@ -202,6 +202,7 @@ potato-brawl/
 - 被顶下去的旧连接**当场**收到 `{t:'account',action:'revoked'}` 并被降级成未登录：不能再改资料 / 动存档，但房间里的位置和这局的战绩归属都不动（`server.js` 的 `revokeOtherSessions()` + 每条消息前的 `sessionAlive()` 双保险 —— 光靠推送挡不住已经发出去的消息）。
 - 登录态变化时身份是**三处一起换**的（`adoptAccount()`：`ws.token` → 房间成员 `np.user/name/token/startWeapon` → 对局玩家 `gp.user/name`）。少换一处就会出现「登录后掉线被请回大厅」「战绩记到上一个账号头上」这类很难查的错位。
 - 连错 8 次密码锁 60 秒；`/api` 层面每个连接每分钟最多 12 次登录尝试。
+- 用户名多一条限制：`__proto__` / `constructor` / `prototype` 这类跟 JS 对象内部属性重名的不让注册（存进 map 会去改原型，写进 JSON 再读回来还会「看着在但取不出」）。
 - 账号上挂着：显示名、开局武器偏好、战绩（场次/胜场/最高波数/击杀/伤害/时长）、无尽纪录、存档 id 列表。
 - ⚠️ **密码是明文存的**（本次需求明确要求「明文存储所有信息，服务器可信」）：`data/accounts.json` 里能直接看到 `pass`。要放公网必须先改成 hash —— 改 `server/src/data/accounts.js` 里 `register()` / `login()` 两处即可，其它逻辑不用动。
 
@@ -220,13 +221,13 @@ potato-brawl/
 - 恢复后**下一波的出场队列是确定的**：存档里连 `rng` 的内部状态一起记了（`makeRng(seed, state)`），同一份存档读两次队列一模一样（测试里锁住了这条）。
 - 权限分开算：**读** = owner 或同房间成员（房主带全房接着打是共享进度）；**删** = 只有 owner，房主身份不构成对别人存档的处置权。
 - 恢复成长时只按账号配对；显示名兜底仅用于「没有账号归属」的老存档/游客。有 `user` 却对这个房间里的任何人都对不上，就当没这个人并给提示 —— 按名字硬套等于让同名的队友白拿别人一整套 build。
-- `data/saves.json` 最多留 200 条，超了丢最老的。每条记录进内存前都过一遍 `sanitizeRun()`（`owners` 不是数组、`items` 不是对象之类一律修形或丢弃），手改坏一条不会让整份存档不可用，也不会把异常抛穿 WebSocket 的消息回调。
+- `data/saves.json` 最多留 200 条，超了丢最老的。每条记录进内存前都过一遍 `sanitizeRun()`（含 id 白名单：`__proto__` 这种特殊 key 当存档 id 会去改对象原型，直接拒）（`owners` 不是数组、`items` 不是对象之类一律修形或丢弃），手改坏一条不会让整份存档不可用，也不会把异常抛穿 WebSocket 的消息回调。
 
 ### 备份导出 / 导入还原
 
 | 入口 | 用法 |
 | --- | --- |
-| 管理页 | `http://<服务器>:3000/admin`，口令在 `data/admin-key.txt`（首次启动自动生成并打印在日志里）。导出=下载一份 JSON；导入支持「合并」，覆盖式导入前自动写 `data/backup-before-import-*.json` 方便回滚 |
+| 管理页 | `http://<服务器>:3000/admin`，口令在 `data/admin-key.txt`（首次启动自动生成并打印在日志里）。导出=下载一份 JSON；导入支持「合并」，覆盖式导入前自动写 `data/backup-before-import-*.json` 方便回滚。导入会**等这次写盘落地**再报成功；写不进去就返回 500 并说清「内存里已生效、重启会退回旧数据」，不会假装还原完成 |
 | 命令行 | `npm run backup`（→ `backups/potato-brawl-backup-<时间>.json`）、`npm run data`（列账号/存档）、`npm run restore backups/xxx.json`、`node tools/data-cli.js verify <文件>` |
 
 - 备份包是一个自包含的明文 JSON：`{ kind, v, exportedAt, counts, accounts, saves, saveSeq }`，`kind`/`v` 不对就拒绝导入；里面混了坏条目会跳过并计数（`skipped`），不会连累好数据。
@@ -253,7 +254,7 @@ npm test                          # 无头集成测试：PvE / FFA / TEAM 三个
 node test/perf-test.js            # 性能基准：8 人 + 70 怪 + 满弹幕，测 tick 耗时
 node test/enemy-jump-test.js      # 敌人跳平台/二段跳回归测试（含稳定性与边界用例）
 node test/net-safety-test.js      # 联机层安全/健壮性回归（含真 WebSocket 端到端）
-node test/account-save-test.js    # 账号 / 检查点存档 / 备份还原 / 无尽模式 / 数据层健壮性（151 项，含管理页与 CLI 子进程）
+node test/account-save-test.js    # 账号 / 检查点存档 / 备份还原 / 无尽模式 / 数据层健壮性（174 项，含管理页与 CLI 子进程）
 node test/browser-verify.js       # 真实浏览器 E2E（需要 npx playwright install chromium）
 ```
 
@@ -268,6 +269,17 @@ node test/browser-verify.js       # 真实浏览器 E2E（需要 npx playwright 
 ---
 
 ## 四点五、改动记录
+
+### v1.0.7 · 第三轮 Qodo review 修复（4 条，都在数据层）
+
+| # | 问题 | 处理 |
+| --- | --- | --- |
+| 1 | `acquireLock()` 是「先读再覆盖」，还会吞掉 `writeFileSync` 的失败后照样 `lockOwned = true` → 并发启动可能两边都以为自己拿到锁；目录只读/盘满时也照样往下写 | 改成 `fs.openSync(lockFile, 'wx')`（O_EXCL）由内核决定胜负：已存在且持有者活着 → `lockError:'busy'` 返回 false；僵死锁才删掉重试（最多三轮）；**任何**写不进去的错误都返回 false 且不认领锁。`server/index.js` 按 `lockError` 区分「被别人占着」和「这目录根本写不了」，都拒绝启动（`--force-data` 是明确写下的免责开关） |
+| 2 | `flushOnce()` 先抓 `dirty` 的名字、再序列化「活文档」、写完把名字从 `dirty` 里删掉 —— 写盘途中来的改动会被标成「已保存」，重启即丢 | 写之前**同步**把每份文档序列化成字符串（不引用活对象），并记下每份文档的改动代数 `gen`；写完只有「代数没变」才清脏标记，变过就留着进下一轮重试。`writeDoc` 拆成 `writeText`，快照与 IO 分离 |
+| 3 | `/admin/import` 里 `await store.flush()` 的 `{ok:false}` 被丢掉，无论如何都回 200 `ok:true` —— 盘满/权限/文件被占时新数据只在内存里，重启悄悄回滚 | 看返回值：失败回 **500** `{ok:false, writtenToDisk:false, error:'…没能写进磁盘…重启会退回旧数据', failed:[...]}`（内存导入仍生效、`sessions` 重绑照做，但绝不说「还原完成」）；`/admin/flush` 同样如实回状态码 |
+| 23 | `saves['__proto__'] = rec` 不是新增记录而是改原型；`JSON.parse` 更阴 —— 文件里的 `"__proto__"` 直接被吃成原型，于是「报告导入成功，但这条存档列不出、取不到、也存不回」 | 存档 id 走 `safeId()`（字符集白名单 + 排除 `__proto__/constructor/prototype/__*Getter__` 等），`sanitizeRun` 里就拒；账号侧 `validUser` 拒绝这些用户名（存进去也是重启后凭空消失），`applyAccounts`/`importBundle`/`replaceDocs` 一律跳过并计入 `skipped`；所有 map 写入走 `safePut()`（`defineProperty`）、读取一律 `hasOwn`（`getSave('constructor')` 不再返回函数）；`putSave` 收到非法 id 自动换发合法的而不是失败 |
+
+回归测试：`test/account-save-test.js` 新增 `[13]`（151 → **174 项**）—— 锁的被拒方不认领/写不了不认领/僵死锁接管、写盘途中改数据仍保持脏且下一轮落盘、快照不是活引用、特殊 key 在文件/导入/注册/删除四条路上都进不来、导入写盘失败回 500 且清障后 `writtenToDisk:true`。
 
 ### v1.0.6 · 第二轮 Qodo review 修复（11 条）
 
@@ -287,7 +299,7 @@ node test/browser-verify.js       # 真实浏览器 E2E（需要 npx playwright 
 | 20 | 管理页导入把账号文档整个换掉，在线连接的 `ws.account` 指向脱离文档的孤儿对象 | `makeAdminHandler({ afterImport })` → 导入后按用户名重绑（账号没了就降级成未登录并提示），响应里回 `{sessions:{rebound,loggedOut}}` |
 | 21 | 存档记录字段形状没校验（`owners` 是字符串就让 `listSavesFor` 抛出去，一条坏记录拖垮存档面板/读档请求） | 新增 `sanitizeRun()`：读盘、导入、`putSave` 三个入口统一洗形状；`server.js` 的消息处理再包一层 try/catch，单条消息出错只记日志 |
 
-回归测试补到 `test/account-save-test.js`（`[12]` 一组，共 151 项：波中存/读不跳波、去重标记、名字兜底不继承 build、重复 join 不重置、越权删除、登录重连回房、A→B 身份对齐、战绩归属、顶号通知、`flushOnce` 失败保留脏标记 + `close()` 抛错、锁认主、坏记录丢弃、导入后重绑）。
+回归测试补到 `test/account-save-test.js`（`[12]`+`[13]` 两组，共 174 项：波中存/读不跳波、去重标记、名字兜底不继承 build、重复 join 不重置、越权删除、登录重连回房、A→B 身份对齐、战绩归属、顶号通知、`flushOnce` 失败保留脏标记 + `close()` 抛错、锁认主、坏记录丢弃、导入后重绑）。
 
 ### v1.0.5 · 账号 + 波次检查点存档 + 备份还原 + 无尽模式
 
