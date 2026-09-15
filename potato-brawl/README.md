@@ -230,7 +230,7 @@ potato-brawl/
 | 管理页 | `http://<服务器>:3000/admin`，口令在 `data/admin-key.txt`（首次启动自动生成并打印在日志里）。导出=下载一份 JSON；导入支持「合并」，覆盖式导入前自动写 `data/backup-before-import-*.json` 方便回滚。导入会**等这次写盘落地**再报成功；写不进去就返回 500 并说清「内存里已生效、重启会退回旧数据」，不会假装还原完成 |
 | 命令行 | `npm run backup`（→ `backups/potato-brawl-backup-<时间>.json`）、`npm run data`（列账号/存档）、`npm run restore backups/xxx.json`、`node tools/data-cli.js verify <文件>` |
 
-- 备份包是一个自包含的明文 JSON：`{ kind, v, exportedAt, counts, accounts, saves, saveSeq }`，`kind`/`v` 不对就拒绝导入；里面混了坏条目会跳过并计数（`skipped`），不会连累好数据。
+- 备份包是一个自包含的明文 JSON：`{ kind, v, exportedAt, counts, accounts, saves, saveSeq }`，`kind`/`v` 不对就拒绝导入；里面混了坏条目会跳过并计数（`skipped`），不会连累好数据。账号记录的**身份以 map 的键名为准**：导入时 `user` 字段跟键名不一致（手改的、外部拼的、或者干脆是 `__proto__`）会被纠正成键名并计入 `fixed` —— 不然「登录找得到、战绩找不到人」这种丢数据很难查。
 - 换机器 = 新机器 `npm run restore` 一次那个 JSON。
 - 服务器在跑时命令行 `import` 会拒绝（`data/.lock` 里是活着的 pid + 实例 id），避免两边抢文件写坏；那种情况请用管理页。
 - 同一个 `data/` 目录只允许一个服务器：`server/index.js` 拿不到锁就**直接退出**（`--force-data` 才强行开）。锁按「pid + 实例 id」认主，`releaseLock()` 只删自己那把 —— 之前第二个进程哪怕启动失败退出，也会把第一个进程的锁擦掉，等于两份数据互相覆盖。
@@ -254,7 +254,7 @@ npm test                          # 无头集成测试：PvE / FFA / TEAM 三个
 node test/perf-test.js            # 性能基准：8 人 + 70 怪 + 满弹幕，测 tick 耗时
 node test/enemy-jump-test.js      # 敌人跳平台/二段跳回归测试（含稳定性与边界用例）
 node test/net-safety-test.js      # 联机层安全/健壮性回归（含真 WebSocket 端到端）
-node test/account-save-test.js    # 账号 / 检查点存档 / 备份还原 / 无尽模式 / 数据层健壮性（174 项，含管理页与 CLI 子进程）
+node test/account-save-test.js    # 账号 / 检查点存档 / 备份还原 / 无尽模式 / 数据层健壮性（188 项，含管理页与 CLI 子进程）
 node test/browser-verify.js       # 真实浏览器 E2E（需要 npx playwright install chromium）
 ```
 
@@ -270,6 +270,17 @@ node test/browser-verify.js       # 真实浏览器 E2E（需要 npx playwright 
 
 ## 四点五、改动记录
 
+### v1.0.8 · 第四轮 Qodo review 修复（2 条）
+
+上一轮我自己写出来的两个洞，被抓得很准：
+
+| # | 问题 | 处理 |
+| --- | --- | --- |
+| 1 | `flushOnce()` 里 `error` 是共用的：`accounts.json` 写失败后，循环下一轮命中 `if (error) skip`，`saves.json` **根本不会被尝试写** → 账号目录出问题时存档会一路停在旧版本，直到关服都写不下去 | 失败改成按文档记（`errors = { accounts:…, saves:… }`），只有 `mkdir` 失败才整体跳过；返回值 `ok = !failed.length`、`wrote` / `failed` / `errors` 分开，管理页与房间提示都能说清「是哪一份、为什么」。顺带 `writeDoc` 失败时清掉的 `.tmp` 也确认不留垃圾 |
+| 24 | `importBundle()` 只校验了 map 的键名，记录里的 `acc.user` 原样保留 → 键 `alice`、`user:'__proto__'`（或指向别人）的记录能导入成功；登录按 key 找得到，之后 `np.user` / `recordMatch` / `attachSave` 全按 `user` 找，于是战绩与存档 id 静默丢弃（歪到 `__proto__` 上更是无处可寻） | 新增 `normalizeAccountEntry()`：**身份以 map 的键名为准** —— 记录里的 `user` 与键名（忽略大小写）一致就照原样，不一致就用键名改写，键名本身是特殊属性名就整条丢掉；`applyAccounts`（读盘）、`importBundle`（管理页/CLI 导入）、`replaceDocs` 三条路共用它，导入结果多回一个 `fixed` 计数并在日志里提示「已按键名纠正」 |
+
+回归测试：`test/account-save-test.js` 新增 `[14]`（174 → **188 项**）—— 「accounts 挡住时 saves 仍落盘、只有失败那半保持脏、错误里带原因、清障后补写」+「三种歪身份（`__proto__` / 指向别人 / 缺字段）全部对齐，登录、战绩、存档 id、写盘读回一条不丢」。
+
 ### v1.0.7 · 第三轮 Qodo review 修复（4 条，都在数据层）
 
 | # | 问题 | 处理 |
@@ -279,7 +290,7 @@ node test/browser-verify.js       # 真实浏览器 E2E（需要 npx playwright 
 | 3 | `/admin/import` 里 `await store.flush()` 的 `{ok:false}` 被丢掉，无论如何都回 200 `ok:true` —— 盘满/权限/文件被占时新数据只在内存里，重启悄悄回滚 | 看返回值：失败回 **500** `{ok:false, writtenToDisk:false, error:'…没能写进磁盘…重启会退回旧数据', failed:[...]}`（内存导入仍生效、`sessions` 重绑照做，但绝不说「还原完成」）；`/admin/flush` 同样如实回状态码 |
 | 23 | `saves['__proto__'] = rec` 不是新增记录而是改原型；`JSON.parse` 更阴 —— 文件里的 `"__proto__"` 直接被吃成原型，于是「报告导入成功，但这条存档列不出、取不到、也存不回」 | 存档 id 走 `safeId()`（字符集白名单 + 排除 `__proto__/constructor/prototype/__*Getter__` 等），`sanitizeRun` 里就拒；账号侧 `validUser` 拒绝这些用户名（存进去也是重启后凭空消失），`applyAccounts`/`importBundle`/`replaceDocs` 一律跳过并计入 `skipped`；所有 map 写入走 `safePut()`（`defineProperty`）、读取一律 `hasOwn`（`getSave('constructor')` 不再返回函数）；`putSave` 收到非法 id 自动换发合法的而不是失败 |
 
-回归测试：`test/account-save-test.js` 新增 `[13]`（151 → **174 项**）—— 锁的被拒方不认领/写不了不认领/僵死锁接管、写盘途中改数据仍保持脏且下一轮落盘、快照不是活引用、特殊 key 在文件/导入/注册/删除四条路上都进不来、导入写盘失败回 500 且清障后 `writtenToDisk:true`。
+回归测试：`test/account-save-test.js` 补 `[13]`（当时 174 项，见下面 v1.0.8）—— 锁的被拒方不认领/写不了不认领/僵死锁接管、写盘途中改数据仍保持脏且下一轮落盘、快照不是活引用、特殊 key 在文件/导入/注册/删除四条路上都进不来、导入写盘失败回 500 且清障后 `writtenToDisk:true`。
 
 ### v1.0.6 · 第二轮 Qodo review 修复（11 条）
 
@@ -299,7 +310,7 @@ node test/browser-verify.js       # 真实浏览器 E2E（需要 npx playwright 
 | 20 | 管理页导入把账号文档整个换掉，在线连接的 `ws.account` 指向脱离文档的孤儿对象 | `makeAdminHandler({ afterImport })` → 导入后按用户名重绑（账号没了就降级成未登录并提示），响应里回 `{sessions:{rebound,loggedOut}}` |
 | 21 | 存档记录字段形状没校验（`owners` 是字符串就让 `listSavesFor` 抛出去，一条坏记录拖垮存档面板/读档请求） | 新增 `sanitizeRun()`：读盘、导入、`putSave` 三个入口统一洗形状；`server.js` 的消息处理再包一层 try/catch，单条消息出错只记日志 |
 
-回归测试补到 `test/account-save-test.js`（`[12]`+`[13]` 两组，共 174 项：波中存/读不跳波、去重标记、名字兜底不继承 build、重复 join 不重置、越权删除、登录重连回房、A→B 身份对齐、战绩归属、顶号通知、`flushOnce` 失败保留脏标记 + `close()` 抛错、锁认主、坏记录丢弃、导入后重绑）。
+回归测试补到 `test/account-save-test.js`（`[12]`–`[14]` 三组，共 188 项：波中存/读不跳波、去重标记、名字兜底不继承 build、重复 join 不重置、越权删除、登录重连回房、A→B 身份对齐、战绩归属、顶号通知、`flushOnce` 失败保留脏标记 + `close()` 抛错、锁认主、坏记录丢弃、导入后重绑）。
 
 ### v1.0.5 · 账号 + 波次检查点存档 + 备份还原 + 无尽模式
 

@@ -47,20 +47,37 @@ function safePut(map, key, value) {
 }
 const hasKey = (map, key) => !!map && Object.prototype.hasOwnProperty.call(map, String(key));
 
+/**
+ * 账号在 map 里的 key 才是大家查它用的身份（`getAccount(user)` 按它查、房间成员 `np.user` 存的也是它）。
+ * 记录里的 `user` 字段必须跟 key 对得上，否则登录按 key 找得到、之后全按 user 找 ——
+ * 战绩、存档 id 就静默丢了（`user:'__proto__'` 更是连查的地方都没有）。
+ * 一致就照原样（保留大小写），不一致就以 key 为准改写；key 本身是特殊属性名就整条丢掉
+ * （那种 key 就算用 defineProperty 塞进去，写回 JSON 再读回来也会被吃成原型 → 账号凭空消失）。
+ */
+function normalizeAccountEntry(key0, acc) {
+  const k = JsonStore.key(key0);
+  if (!k || reservedKey(k) || !acc || typeof acc !== 'object' || Array.isArray(acc)) return null;
+  const declared = String(acc.user == null ? '' : acc.user).trim();
+  const agreed = !!declared && JsonStore.key(declared) === k;
+  const user = agreed ? declared : String(key0).trim();
+  if (!user || reservedKey(user)) return null;
+  return { k, user, repaired: !agreed && !!declared };
+}
+
 function applyAccounts(store, doc) {
   if (!doc || !doc.accounts || typeof doc.accounts !== 'object') return;
   const accounts = {};
-  let dropped = 0;
+  let dropped = 0, fixed = 0;
   for (const [k0, acc] of Object.entries(doc.accounts)) {
-    const k = JsonStore.key(k0);
-    // 手改过的 accounts.json 里也可能塞进 __proto__ / 非对象值：逐个过一遍，坏的丢掉
-    // （特殊 key 就算用 defineProperty 塞进去了，写回 JSON 再读回来也会变成原型 → 账号凭空消失，
-    //   所以宁可丢掉，也不能让它进 map）
-    if (!k || reservedKey(k) || !acc || typeof acc !== 'object' || Array.isArray(acc)) { dropped++; continue; }
-    safePut(accounts, k, sanitizeAccount({ ...acc, user: acc.user || k0 }));
+    // 手改过的 accounts.json 也可能塞进 __proto__ / 非对象值：逐个过一遍，坏的丢掉、歪的纠正
+    const norm = normalizeAccountEntry(k0, acc);
+    if (!norm) { dropped++; continue; }
+    if (norm.repaired) fixed++;
+    safePut(accounts, norm.k, sanitizeAccount({ ...acc, user: norm.user }));
   }
   store.accountsDoc = { ...EMPTY_ACCOUNTS(), ...doc, accounts };
   if (dropped) console.error(`[data] accounts.json 里有 ${dropped} 条记录形状不对，已忽略（其余照常可用）`);
+  if (fixed) console.warn(`[data] accounts.json 里有 ${fixed} 条记录的 user 与键名不符，已按键名纠正`);
 }
 function applySaves(store, doc) {
   if (!doc || !doc.saves) return;
@@ -368,11 +385,12 @@ export class JsonStore {
     if (src.v && src.v > DATA_VERSION) throw new Error(`备份版本 ${src.v} 比服务器支持的 ${DATA_VERSION} 新`);
 
     const accounts = {};
-    let skipped = 0;
+    let skipped = 0, fixed = 0;
     for (const [k0, acc] of Object.entries(src.accounts)) {
-      const k = JsonStore.key(k0);
-      if (!k || reservedKey(k) || !acc || typeof acc !== 'object' || Array.isArray(acc) || typeof acc.user !== 'string') { skipped++; continue; }
-      safePut(accounts, k, sanitizeAccount({ ...acc, user: acc.user || k0 }));
+      const norm = normalizeAccountEntry(k0, acc);
+      if (!norm) { skipped++; continue; }
+      if (norm.repaired) fixed++;
+      safePut(accounts, norm.k, sanitizeAccount({ ...acc, user: norm.user }));
     }
     let rawSaves = src.saves && typeof src.saves === 'object' ? src.saves : {};
     if (Array.isArray(rawSaves)) { const o = {}; for (const item of rawSaves) if (item && item.id) safePut(o, item.id, item); rawSaves = o; }
@@ -394,7 +412,7 @@ export class JsonStore {
     }
     this.trimSaves();
     this.mark('accounts'); this.mark('saves');
-    return { accounts: Object.keys(accounts).length, saves: Object.keys(saves).length, skipped, merge };
+    return { accounts: Object.keys(accounts).length, saves: Object.keys(saves).length, skipped, fixed, merge };
   }
 
   /** 整包替换（CLI 用） */
@@ -403,9 +421,9 @@ export class JsonStore {
     if (accounts && typeof accounts === 'object') {
       const clean = {};
       for (const [k0, acc] of Object.entries(accounts)) {
-        const k = JsonStore.key(k0);
-        if (!k || !acc || typeof acc !== 'object' || Array.isArray(acc) || typeof acc.user !== 'string') continue;
-        safePut(clean, k, sanitizeAccount({ ...acc, user: acc.user || k0 }));
+        const norm = normalizeAccountEntry(k0, acc);
+        if (!norm) continue;
+        safePut(clean, norm.k, sanitizeAccount({ ...acc, user: norm.user }));
       }
       this.accountsDoc = { ...EMPTY_ACCOUNTS(), accounts: clean };
     }
@@ -462,25 +480,31 @@ export class JsonStore {
       doc.updatedAt = now;
       snap.set(w, { text: JSON.stringify(doc, null, 2) + '\n', gen: this.gen[w] });
     }
-    // 2) 写盘。两份文档各自独立：accounts.json 写失败不该连累 saves.json 也跳过
+    // 2) 写盘。**每份文档自己成败**：accounts.json 写不了不能顺手把 saves.json 跳掉 ——
+    //    那样存档会一直停在旧版本，直到关服都写不下去（失败原因按文档记着，给上层报）
     const wrote = [];
     const failed = [];
-    let error = null;
-    try { await fsp.mkdir(this.dir, { recursive: true }); } catch (e) { error = e; failed.push(...which); }
+    const errors = {};
+    const mkdirErr = await fsp.mkdir(this.dir, { recursive: true }).catch((e) => e);
     for (const w of which) {
-      if (error && failed.length) { failed.push(w); continue; }
+      if (mkdirErr) { errors[w] = mkdirErr; failed.push(w); continue; }
       const file = w === 'accounts' ? this.accountsFile : this.savesFile;
       try { await this.writeText(file, snap.get(w).text); wrote.push(w); }
-      catch (e) { error = error || e; failed.push(w); }
+      catch (e) { errors[w] = e; failed.push(w); }
     }
+    const error = mkdirErr || Object.keys(errors).map((k) => errors[k])[0] || null;
     // 3) 只有「写完这一版之后没人再改过」才清脏标记 —— 期间被改过就留着，下一轮再写。
     //    直接 delete 会把新改动标成已保存，重启就丢了。
     for (const w of wrote) {
       if (this.gen[w] === snap.get(w).gen) this.dirty.delete(w);
       else this.staleWrites = (this.staleWrites || 0) + 1;
     }
-    if (error) console.error('[data] 落盘失败，改动先留在内存里等下次重试：', error.message || error);
-    return { ok: !error, wrote, failed, error };
+    if (error) {
+      const why = Object.keys(errors).map((k) => `${k}(${errors[k].code || errors[k].message})`).join(' ');
+      console.error('[data] 落盘失败，改动先留在内存里等下次重试：', why || (error.message || error));
+    }
+    // error 只是「第一个失败原因」，给文案用；判定一律看 ok / failed（一份失败不影响另一份）
+    return { ok: !failed.length, wrote, failed, errors, error };
   }
 
   /** 平时的落盘：串到写盘队列；失败就 2 秒后再试，不把没写成的改动标成已保存 */

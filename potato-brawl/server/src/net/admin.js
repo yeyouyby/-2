@@ -167,13 +167,17 @@ export function makeAdminHandler({ store, key, manager, afterImport = null }) {
       let rebound = null;
       if (afterImport) { try { rebound = afterImport(); } catch (e) { rebound = { error: String(e && e.message) }; } }
       if (!onDisk) {
-        const why = (flushed && flushed.error && (flushed.error.code || flushed.error.message)) || '未知错误';
+        const detail = flushed && flushed.errors
+          ? Object.entries(flushed.errors).map(([k, e]) => `${k}：${e.code || e.message}`).join('，')
+          : '';
+        const why = detail || (flushed && flushed.error && (flushed.error.code || flushed.error.message)) || '未知错误';
         json(res, 500, {
           ok: false,
           writtenToDisk: false,
           error: `导入已在内存里生效，但没能写进磁盘（${why}）：现在重启会退回旧数据。`
             + `清掉盘满/权限问题后再点一次「强制落盘」，或先导出当前状态自己留一份`,
-          imported: result, rollback: savedAs || null, sessions: rebound, failed: (flushed && flushed.failed) || [],
+          imported: result, fixedAccounts: result.fixed || 0, rollback: savedAs || null, sessions: rebound,
+          failed: (flushed && flushed.failed) || [],
         });
         return true;
       }

@@ -848,6 +848,66 @@ try {
     ok(okImport.status === 200 && JSON.parse(okImport.body).writtenToDisk === true, '正常导入仍然 200 且明确写盘成功', okImport.body.replace(/\s+/g, ' ').slice(0, 90));
   }
 
+  // ============================================================
+  console.log('\n[14] 第四轮 review：两份文档各写各的 / 导入的账号身份必须与键名一致');
+
+  // ---- accounts.json 写不下去时，saves.json 照样要落盘 ----
+  {
+    const dirB = tmp('bothdocs');
+    const sB = new JsonStore(dirB).loadSync();
+    sB.closed = true;
+    sB.putAccount({ user: 'blocker', pass: 'abcd', name: 'B' });
+    sB.putSave({ wave: 3, owners: ['blocker'], players: [], label: '波次检查点' });
+    fs.mkdirSync(path.join(dirB, 'accounts.json'));              // 只挡 accounts
+    const r = await sB.flushOnce();
+    ok(r.ok === false && r.wrote.includes('saves') && r.failed.includes('accounts'),
+      '一份文档写失败不挡另一份：saves 落盘、accounts 记为失败', JSON.stringify([r.wrote, r.failed]));
+    ok(fs.existsSync(path.join(dirB, 'saves.json')) && !fs.existsSync(path.join(dirB, 'accounts.json.tmp')),
+      'saves.json 真的写下去了（不是被 skip 掉），失败的 .tmp 也没留垃圾');
+    ok(JSON.parse(fs.readFileSync(path.join(dirB, 'saves.json'), 'utf8')).saves[Object.keys(sB.savesDoc.saves)[0]].wave === 3,
+      '盘上的存档内容就是这一轮的改动');
+    ok(sB.dirty.has('accounts') && !sB.dirty.has('saves'), '只有失败的那半仍然保持脏，写成功的清掉');
+    ok(r.errors && !!r.errors.accounts && /EISDIR/.test(String(r.errors.accounts.code)), '返回值里能看到是哪份文档、为什么失败', String(r.errors && r.errors.accounts && r.errors.accounts.code));
+    fs.rmdirSync(path.join(dirB, 'accounts.json'));
+    const r2 = await sB.flushOnce();
+    ok(r2.ok && JSON.parse(fs.readFileSync(path.join(dirB, 'accounts.json'), 'utf8')).accounts.blocker, '障碍清掉后重试把 accounts 补上');
+    fs.rmSync(dirB, { recursive: true, force: true });
+  }
+
+  // ---- 导入的账号记录：身份一律以 map 的键名为准 ----
+  {
+    const dirI = tmp('idfix');
+    const sI = new JsonStore(dirI).loadSync();
+    const svc = new AccountService(sI);
+    const res = sI.importBundle({
+      kind: 'potato-brawl-backup', v: 1,
+      accounts: {
+        alice: { user: '__proto__', pass: 'abcd', name: '歪的' },        // 记录里的 user 是特殊 key
+        bob: { user: 'someoneelse', pass: 'abcd', name: '张冠李戴' },     // 记录里的 user 指向别人
+        Carol: { user: 'carol', pass: 'abcd', name: '大小写' },          // 只差大小写：别乱改人家写的
+        Dave: { pass: 'abcd', name: '没写 user' },                        // 干脆没有 user 字段
+      },
+      saves: {},
+    }, { merge: true });
+    ok(res.accounts === 4 && res.fixed === 2, '两条身份不一致的被纠正（fixed 报出来），没有静默丢记录', JSON.stringify(res));
+    ok(sI.getAccount('alice').user === 'alice' && sI.getAccount('bob').user === 'bob', 'user 全部对齐到键名', JSON.stringify([sI.getAccount('alice').user, sI.getAccount('bob').user]));
+    ok(sI.getAccount('carol').user === 'carol', '只差大小写时保留记录里自己写的，不去动它');
+    ok(sI.getAccount('dave').user === 'Dave', '没写 user 的就用键名补上（保留键名的大小写）');
+    ok(!sI.getAccount('__proto__') && !sI.getAccount('someoneelse'), '也没有凭白多出一个「__proto__ 账号」或串到别人身上');
+    const login = svc.login({ user: 'alice', pass: 'abcd' });
+    ok(login.ok, '身份纠正后 alice 照样能登录');
+    svc.recordMatch('alice', { mode: 'pve', wave: 7, win: true, kills: 5, damage: 100, time: 60 });
+    svc.attachSave('alice', 'sX');
+    const a = sI.getAccount('alice');
+    ok(a.stats.matches === 1 && a.stats.bestWave === 7 && a.saves.includes('sX'),
+      '战绩与存档 id 都落到了这个账号上（不写进 __proto__ / 不丢）', JSON.stringify([a.stats.matches, a.stats.bestWave, a.saves]));
+    await sI.close();
+    const back = new AccountService(new JsonStore(dirI).loadSync());
+    const re = back.login({ user: 'alice', pass: 'abcd' });
+    ok(re.ok && re.account.user === 'alice' && re.account.stats.matches === 1, '写盘再读回来身份仍然一致（不会「看着在、重启就没了」）');
+    fs.rmSync(dirI, { recursive: true, force: true });
+  }
+
   a.close();
   await store.flush();   // 关服前把没落盘的改动写完，测试才敢直接读文件
 } finally {
