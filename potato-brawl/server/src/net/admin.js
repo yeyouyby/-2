@@ -105,7 +105,7 @@ load();
 /**
  * @returns {Promise<boolean>} true = 这个请求已由管理模块处理掉了
  */
-export function makeAdminHandler({ store, key, manager }) {
+export function makeAdminHandler({ store, key, manager, afterImport = null }) {
   return async function handleAdmin(req, res) {
     const url = new URL(req.url, 'http://localhost');
     const p = url.pathname;
@@ -159,7 +159,11 @@ export function makeAdminHandler({ store, key, manager }) {
       try { result = store.importBundle(doc, { merge: url.searchParams.get('merge') === '1' }); }
       catch (e) { json(res, 400, { error: e.message, rollback: savedAs }); return true; }
       await store.flush();
-      json(res, 200, { ok: true, imported: result, rollback: savedAs || null });
+      // 账号文档被整份换掉了：在线连接手里那份对象已经是孤儿，继续改资料/记战绩会写进
+      // 一个没人引用的对象（看着成功，其实丢了）—— 让服务器按用户名重新绑一次
+      let rebound = null;
+      if (afterImport) { try { rebound = afterImport(); } catch (e) { rebound = { error: String(e && e.message) }; } }
+      json(res, 200, { ok: true, imported: result, rollback: savedAs || null, sessions: rebound });
       return true;
     }
     if (p === '/admin/flush') { await store.flush(); json(res, 200, { ok: true }); return true; }

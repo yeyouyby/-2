@@ -9,6 +9,8 @@
 // [6] 真服务器 + 真 WebSocket：未登录被拒、注册登录、自动存档落盘、跨房间读档、纪录写入
 // [7] 管理接口：口令、导出下载、导入 merge、坏 JSON 拒绝
 // [8] 命令行备份工具：export / verify / import 到另一个数据目录
+// [9]-[11] 结算写进账号 / 管理接口细节 / CLI 子进程
+// [12] 第二轮 review 的回归：存档点语义、越权删除、身份对齐、顶号、写盘失败、锁认主、坏记录容错
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -335,17 +337,29 @@ try {
   ok(Object.keys(onDisk.saves).length === 1, 'saves.json 里确实落了 1 条', JSON.stringify(Object.keys(onDisk.saves)));
   ok(String(fs.readFileSync(path.join(dataDir, 'saves.json'), 'utf8')).includes('\n  "saves"'), '文件是缩进过的明文 JSON（能直接看能手改）');
 
-  // 给玩家一点成长，再手动存一次，然后换个房间读回来
+  // 给玩家一点成长；先在「波中」手存、再在「商店里」手存 —— 两者语义不同
   const gp = room.game.players.get(w1.id);
-  room.game.beginWave(4);
+  room.game.beginWave(4);                       // 第 4 波正在打
   gp.level = 6; gp.xp = 30; gp.coins = 300; gp.items = { apple: 2 }; gp.weapons = [{ id: 'smg', cd: 0 }];
   a.send(JSON.stringify({ t: 'saveNow' }));
   const savedMan = await A.wait((m) => m.t === 'saved' && !m.auto);
   ok(!savedMan.__miss, '房主可以手动存档', miss(savedMan));
   const saveId = savedMan.id;
+  const midRun = store.getSave(saveId);
+  ok(midRun.wave === 3 && /本波重打/.test(midRun.label),
+    '波中手存记的是「第 4 波从头打」：不会把正在打的这一波白送过去', JSON.stringify([midRun.wave, midRun.label]));
   a.send(JSON.stringify({ t: 'saves' }));
   const list = await A.wait((m) => m.t === 'saveList');
   ok(list.saves && list.saves.length === 2 && list.saves.some((x) => x.id === saveId), '存档列表有两条（自动 + 手动）', JSON.stringify(list.saves && list.saves.map((x) => x.wave)));
+
+  // 商店里再存一次 → 「下一波开始前」，而且是独立的一条记录
+  room.game.phase = 'prep';
+  A.clear();
+  a.send(JSON.stringify({ t: 'saveNow' }));
+  const savedPrep = await A.wait((m) => m.t === 'saved' && !m.auto);
+  const prepRun = store.getSave(savedPrep.id);
+  ok(prepRun && prepRun.wave === 4 && /第 5 波前/.test(prepRun.label), '商店里手存记的是「第 5 波前」', JSON.stringify(prepRun && [prepRun.wave, prepRun.label]));
+  ok(savedPrep.id !== saveId, '两次手存是两条检查点，不互相覆盖');
 
   A.clear();
   a.send(JSON.stringify({ t: 'leave' }));
@@ -355,9 +369,13 @@ try {
   A.clear();
   a.send(JSON.stringify({ t: 'saveLoad', id: saveId }));
   const loaded = await A.wait((m) => m.t === 'loaded');
-  ok(!loaded.__miss && loaded.wave === 5 && loaded.restored === 1, '从存档点继续：下一波是第 5 波，1 人的 build 接上了', JSON.stringify(loaded));
+  ok(!loaded.__miss && loaded.wave === 4 && loaded.restored === 1, '读「波中检查点」→ 第 4 波重打，1 人的 build 接上', JSON.stringify(loaded));
   const snap = await A.wait((m) => m.t === 'snap' && m.me, 6000);
-  ok(!snap.__miss && snap.ph === 'prep' && snap.w === 4, '快照里就在商店阶段、波数是 4（打完的波数）', JSON.stringify(snap.ph + '/' + snap.w));
+  ok(!snap.__miss && snap.ph === 'prep' && snap.w === 3, '快照：停在商店阶段、已完成 3 波', String(snap.ph) + '/' + String(snap.w));
+  A.clear();
+  a.send(JSON.stringify({ t: 'saveLoad', id: savedPrep.id }));
+  const loaded2 = await A.wait((m) => m.t === 'loaded');
+  ok(loaded2.wave === 5, '读「商店检查点」→ 从第 5 波继续（正常推进语义没被改坏）', JSON.stringify(loaded2));
   ok(snap.me && snap.me.lv === 6 && snap.me.coins === 300, '等级与金币从存档点恢复', JSON.stringify(snap.me && { lv: snap.me.lv, coins: snap.me.coins }));
   ok(snap.me.it && snap.me.it.apple === 2, '道具恢复了');
   ok(snap.me.w && snap.me.w[0].id === 'smg', '武器恢复了', JSON.stringify(snap.me && snap.me.w));
@@ -460,7 +478,259 @@ try {
   ok(refused, '服务器在跑时 CLI 拒绝 import（防抢文件）');
   fs.rmSync(dirC, { recursive: true, force: true });
 
+  // ============================================================
+  console.log('\n[12] 本轮 review 的修复回归');
+
+  // ---- 波中存过之后，本波打完仍会自动存一次（去重标记带阶段） ----
+  {
+    A.clear();
+    a.send(JSON.stringify({ t: 'create', roomName: '去重测试房' }));
+    const j4 = await A.wait((m) => m.t === 'joined');
+    ok(!!j4.code, '为去重测试单开一个房间', miss(j4));
+    a.send(JSON.stringify({ t: 'ready', v: true }));
+    a.send(JSON.stringify({ t: 'start' }));
+    await A.wait((m) => m.t === 'start');
+    const roomW = manager.getRoom(j4.code);
+    roomW.game.phase = 'prep';
+    roomW.game.wave = 6;
+    roomW.lastCheckpointTag = 'w6';              // 假装「这一波中途手存过」
+    const before = store.saveCount();
+    roomW.tick(1 / 60);
+    const autoAfterMid = store.listSaves().find((r) => r.wave === 6 && /第 7 波前/.test(r.label));
+    ok(!!autoAfterMid && store.saveCount() === before + 1,
+      '波中存过之后，这一波清完进商店还会自动存一次（不被去重标记吞掉）', JSON.stringify([before, store.saveCount()]));
+    ok(roomW.lastCheckpointTag === 'p6', '去重标记换成了「商店 + 第 6 波」', roomW.lastCheckpointTag);
+    roomW.tick(1 / 60);
+    ok(store.saveCount() === before + 1, '同一波同一阶段不重复写盘', String(store.saveCount()));
+  }
+
+  // ---- 形状奇怪的存档记录：入口规范化，读的一侧不抛 ----
+  store.putSave({ id: 'weird1', wave: 1, owners: 'hero', by: 'hero', players: [{ name: '甲', items: 'x', weapons: 'no' }], createdAt: Date.now() });
+  A.clear();
+  a.send(JSON.stringify({ t: 'saves' }));
+  const listWeird = await A.wait((m) => m.t === 'saveList');
+  ok(!!listWeird.saves && listWeird.saves.some((x) => x.id === 'weird1'),
+    'owners 是字符串 / items 不是对象的记录被规范化后仍能列出，不会把 WebSocket 回调抛出去', miss(listWeird));
+  const weird = store.getSave('weird1');
+  ok(Array.isArray(weird.owners) && weird.owners.includes('hero') && typeof weird.players[0].items === 'object' && Array.isArray(weird.players[0].weapons),
+    '进内存前就洗过一遍：owners→数组、items→对象、weapons→字符串数组', JSON.stringify([weird.owners, weird.players[0].items, weird.players[0].weapons]));
+  {
+    const dirBad = tmp('badrun');
+    fs.writeFileSync(path.join(dirBad, 'saves.json'), JSON.stringify({
+      v: 1,
+      saves: { ok1: { wave: 2, owners: ['hero'], players: [{ name: '甲', level: 3 }] }, nul: null, bad: { players: 3 } },
+    }));
+    const sB = new JsonStore(dirBad).loadSync();
+    ok(sB.saveCount() === 1, '读盘时坏记录被丢弃，好记录照常可用（不拖垮整份 saves.json）', String(sB.saveCount()));
+    fs.rmSync(dirBad, { recursive: true, force: true });
+  }
+
+  // ---- 落盘失败：脏标记保留 + close 报错 ----
+  {
+    const dirF = tmp('flushfail');
+    const sF = new JsonStore(dirF).loadSync();
+    sF.closed = true;                                  // 自己控制写入时机，不让后台定时器插一脚
+    sF.putAccount({ user: 'keepme', pass: 'abcd', name: 'K', session: 's1', prefs: {}, stats: {}, saves: [] });
+    fs.mkdirSync(path.join(dirF, 'accounts.json'));    // 用同名目录占位，rename 必失败
+    const r1 = await sF.flushOnce();
+    ok(r1.ok === false && sF.dirty.has('accounts'), '写失败时脏标记保留（不会被当成「已保存」）', JSON.stringify(r1.wrote));
+    fs.rmdirSync(path.join(dirF, 'accounts.json'));
+    const r2 = await sF.flushOnce();
+    ok(r2.ok && !sF.dirty.has('accounts') && JSON.parse(fs.readFileSync(path.join(dirF, 'accounts.json'), 'utf8')).accounts.keepme,
+      '障碍清掉后重试把同一份改动写下去了，数据没丢');
+    sF.putSave({ wave: 1, owners: ['keepme'], players: [] });
+    fs.mkdirSync(path.join(dirF, 'saves.json'));
+    let threwClose = false;
+    try { await sF.close(); } catch { threwClose = true; }
+    ok(threwClose, '退出时仍写不进去 → 抛错让启动脚本报错，而不是静默丢掉账号/存档');
+    fs.rmdirSync(path.join(dirF, 'saves.json'));
+    fs.rmSync(dirF, { recursive: true, force: true });
+  }
+
+  // ---- data/.lock 认主 ----
+  {
+    const dirL = tmp('lock');
+    const L1 = new JsonStore(dirL).loadSync();
+    const L2 = new JsonStore(dirL).loadSync();
+    ok(L1.acquireLock() === true && L2.acquireLock() === false, '第二个实例拿不到同一个数据目录的锁');
+    L2.releaseLock();
+    ok(fs.existsSync(path.join(dirL, '.lock')), '非持锁者 releaseLock 不会删掉别人的锁（不会误放开第二个服务器）');
+    ok(JsonStore.dirBusy(dirL) !== false, 'dirBusy 能看出目录被占（命令行还原靠它拒绝写入）');
+    L1.releaseLock();
+    ok(!fs.existsSync(path.join(dirL, '.lock')) && L2.acquireLock() === true, '持锁者退出后锁被释放，别人能接手');
+    L2.releaseLock();
+    fs.rmSync(dirL, { recursive: true, force: true });
+  }
+
+  // ---- 读档的显示名兜底：不再把别人的 build 送给同名的人 ----
+  {
+    const settings = cleanSettings({ mode: 'pve' }, DEFAULT_SETTINGS);
+    const gS = new Game(fakeRoom(settings));
+    gS.addPlayer({ id: 'zz1', name: '公用名', slot: 0, user: 'attacker' });
+    gS.start();
+    const rs = applyCheckpoint(gS, {
+      wave: 2, seed: 7, settings,
+      players: [{ user: 'victim', name: '公用名', level: 77, coins: 9999, items: { armor: 5 }, weapons: ['sniper'], hp: 500 }],
+    });
+    ok(rs.restored === 0, '存档记录的用户不在这个房间里 → 谁也不给他这一套 build', JSON.stringify(rs.warnings));
+    ok(gS.players.get('zz1').level === 1 && gS.players.get('zz1').coins === 0, '同名的另一个人没有白拿 77 级');
+    const gT = new Game(fakeRoom(settings));
+    gT.addPlayer({ id: 'zz2', name: '游客甲', slot: 0 });
+    gT.start();
+    const rt = applyCheckpoint(gT, { wave: 1, seed: 9, settings, players: [{ user: '', name: '游客甲', level: 9, coins: 50, items: {}, weapons: ['sword'] }] });
+    ok(rt.restored === 1 && gT.players.get('zz2').level === 9, '没有账号归属的老存档仍按显示名恢复', JSON.stringify(rt));
+  }
+
+  // ---- 别处登录会撤销旧连接的账号能力 ----
+  const c = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+  const C = track(c);
+  await new Promise((r) => c.on('open', r));
+  c.send(JSON.stringify({ t: 'hello', protocol: 1, name: '多设备', token: 'tok-m' }));
+  await C.wait((m) => m.t === 'welcome');
+  c.send(JSON.stringify({ t: 'register', user: 'multi', pass: 'abcd', name: '多设备' }));
+  const multiReg = await C.wait((m) => m.t === 'account' && m.ok);
+  ok(!!multiReg.token, '注册 multi 成功（拿到会话 token）');
+  c.send(JSON.stringify({ t: 'create', roomName: '设备一' }));
+  const cJoin = await C.wait((m) => m.t === 'joined');
+  ok(!!cJoin.code, 'multi 能建房', miss(cJoin));
+  const cRoom = manager.getRoom(cJoin.code);
+  const cKey = [...cRoom.players.keys()][0];
+  ok(cRoom.players.get(cKey).user === 'multi', '房间成员挂着账号归属');
+
+  const c2 = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+  const C2 = track(c2);
+  await new Promise((r) => c2.on('open', r));
+  c2.send(JSON.stringify({ t: 'hello', protocol: 1, name: '第二台', token: 'tok-m2' }));
+  await C2.wait((m) => m.t === 'welcome');
+  C2.clear();
+  c2.send(JSON.stringify({ t: 'login', user: 'multi', pass: 'abcd' }));
+  const reLogin = await C2.wait((m) => m.t === 'account' && m.ok);
+  ok(!!reLogin.account && reLogin.account.user === 'multi', '同一账号在另一处登录成功（会话换发）', miss(reLogin));
+  const rev = await C.wait((m) => m.t === 'account' && m.action === 'revoked', 4000);
+  ok(!rev.__miss, '旧连接当场收到「账号已在别处登录」的通知（不用等它下一次操作才发现）', miss(rev));
+  C.clear();
+  c.send(JSON.stringify({ t: 'saveNow' }));
+  const needRe = await C.wait((m) => m.t === 'needLogin');
+  ok(!needRe.__miss, '旧连接再动账号相关操作会被要求重新登录，而不是写进这个账号', miss(needRe));
+  ok(cRoom.players.has(cKey), '但它在对局里的位置没被踢掉');
+  c2.close();
+
+  // ---- 登录状态下掉线重连能回到原房间（token 语义对齐） ----
+  const d = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+  const D = track(d);
+  await new Promise((r) => d.on('open', r));
+  d.send(JSON.stringify({ t: 'hello', protocol: 1, name: '重连号', token: 'tok-d' }));
+  await D.wait((m) => m.t === 'welcome');
+  d.send(JSON.stringify({ t: 'register', user: 'recon', pass: 'abcd', name: '重连号' }));
+  const regD = await D.wait((m) => m.t === 'account' && m.ok);
+  const sessionToken = regD.token;
+  d.send(JSON.stringify({ t: 'create', roomName: '重连房' }));
+  const dJoin = await D.wait((m) => m.t === 'joined');
+  d.send(JSON.stringify({ t: 'ready', v: true }));
+  d.send(JSON.stringify({ t: 'start' }));
+  await D.wait((m) => m.t === 'start');
+  d.close();                                        // 模拟掉线
+  await new Promise((r) => setTimeout(r, 150));
+  const d2 = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+  const D2 = track(d2);
+  await new Promise((r) => d2.on('open', r));
+  D2.clear();
+  d2.send(JSON.stringify({ t: 'hello', protocol: 1, name: '重连号', token: sessionToken }));
+  const wD2 = await D2.wait((m) => m.t === 'welcome');
+  ok(wD2.account && wD2.account.user === 'recon', '重连时用登录后的 token 免密认出账号', JSON.stringify(wD2.account && wD2.account.user));
+  const back = await D2.wait((m) => (m.t === 'room' && m.room) || m.t === 'joined', 4000);
+  const backCode = back.t === 'room' ? back.room.code : back.code;
+  ok(backCode === dJoin.code, '掉线后重连回到原来那个房间，而不是被请回大厅', JSON.stringify([back.t, backCode, dJoin.code]));
+  const rD = manager.getRoom(dJoin.code);
+  const dKey = [...rD.players.keys()][0];
+  ok(rD.players.get(dKey).token === sessionToken, '房间成员手里的 token 也换成了会话 token（下次重连还认得）', rD.players.get(dKey).token === sessionToken ? '' : 'still 握手 token');
+  ok(rD.players.get(dKey).connected === true, '房间侧 connected 恢复了');
+  D2.clear();
+  d2.send(JSON.stringify({ t: 'saveNow' }));
+  const d2Save = await D2.wait((m) => m.t === 'saved', 4000);
+  ok(!d2Save.__miss, '重连后的连接照样能存档', miss(d2Save));
+  d2.close();
+
+  // ---- 在房间里才登录：身份字段一起换 + 重复 join 不重置 + 战绩归属 ----
+  const e = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+  const E = track(e);
+  await new Promise((r) => e.on('open', r));
+  e.send(JSON.stringify({ t: 'hello', protocol: 1, name: '早进场', token: 'tok-e' }));
+  await E.wait((m) => m.t === 'welcome');
+  e.send(JSON.stringify({ t: 'register', user: 'early', pass: 'abcd', name: '早进场' }));
+  await E.wait((m) => m.t === 'account' && m.ok);
+  e.send(JSON.stringify({ t: 'create', roomName: '中途登录' }));
+  const eJoin = await E.wait((m) => m.t === 'joined');
+  e.send(JSON.stringify({ t: 'ready', v: true }));
+  e.send(JSON.stringify({ t: 'start' }));
+  await E.wait((m) => m.t === 'start');
+  const roomE = manager.getRoom(eJoin.code);
+  const eId = [...roomE.players.keys()][0];
+  E.clear();                       // 别把上一个 register 的回执当成这次的
+  e.send(JSON.stringify({ t: 'register', user: 'late', pass: 'abcd', name: '改名了' }));
+  const lateAcc = await E.wait((m) => m.t === 'account' && m.ok && m.account && m.account.user === 'late');
+  ok(!!lateAcc.account && lateAcc.account.user === 'late', '这条连接在房间中途改登另一个账号', JSON.stringify(lateAcc).slice(0, 90));
+  const npE = roomE.players.get(eId);
+  ok(npE.user === 'late' && npE.name === '改名了' && npE.token === lateAcc.token,
+    '房间成员的 user / name / token 一起对齐（掉线重连才能继续认人）', JSON.stringify([npE.user, npE.name, npE.token === lateAcc.token]));
+  ok(roomE.game.players.get(eId).user === 'late', '对局里的玩家也换了归属（战绩不会记到旧账号头上）');
+  {
+    const gpE = roomE.game.players.get(eId);
+    gpE.hp = 4;
+    E.clear();
+    e.send(JSON.stringify({ t: 'join', code: eJoin.code, name: '换了个名' }));
+    const reJoin = await E.wait((m) => m.t === 'joined');
+    ok(!!reJoin.code && reJoin.code === eJoin.code, '对自己已在的房间重复 join：当重连接待', miss(reJoin));
+    ok(roomE.game.players.get(eId) === gpE && gpE.hp < gpE.maxHp, '角色没被重建：血没回满、没被拉回出生点', String(gpE.hp));
+    ok(roomE.players.get(eId).host === true, '房主标记还在（房间非空时不该被冲掉）');
+    ok(roomE.players.size === 1, '也没多出个成员');
+    roomE.game.endGame(false, 'wipe');
+    await new Promise((r) => setTimeout(r, 300));
+    const accDisk = JSON.parse(fs.readFileSync(path.join(dataDir, 'accounts.json'), 'utf8')).accounts;
+    ok(accDisk.late && accDisk.late.stats.matches === 1 && (!accDisk.early || !accDisk.early.stats.matches),
+      '这局战绩记在换后的账号上，旧账号没被冒领', JSON.stringify({ late: accDisk.late && accDisk.late.stats.matches, early: accDisk.early && accDisk.early.stats.matches }));
+  }
+
+  // ---- 房主不能删别人的存档 ----
+  const f = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+  const F = track(f);
+  await new Promise((r) => f.on('open', r));
+  f.send(JSON.stringify({ t: 'hello', protocol: 1, name: '贼', token: 'tok-f' }));
+  await F.wait((m) => m.t === 'welcome');
+  f.send(JSON.stringify({ t: 'register', user: 'thief3', pass: 'abcd', name: '贼' }));
+  await F.wait((m) => m.t === 'account' && m.ok);
+  f.send(JSON.stringify({ t: 'create', roomName: '贼窝' }));
+  await F.wait((m) => m.t === 'joined');
+  F.clear();
+  f.send(JSON.stringify({ t: 'saveDelete', id: saveId }));
+  const stealDel = await F.wait((m) => m.t === 'err' || m.t === 'saveList');
+  ok(!!store.getSave(saveId) && /只能删自己名下/.test(String(stealDel.msg || '')), '自己是房主也删不掉别人的存档', JSON.stringify(stealDel).slice(0, 90));
+  A.clear();
+  a.send(JSON.stringify({ t: 'saveDelete', id: 'weird1' }));
+  await A.wait((m) => m.t === 'saveList');
+  ok(!store.getSave('weird1') && !!store.getSave(saveId), 'owner 照样删得掉自己的（weird1 已删，hero 的那份没动）');
+  f.close();
+
+  // ---- 管理页导入后，在线连接重新绑到新对象 ----
+  {
+    const bundleNow = JSON.parse(JSON.stringify(store.exportBundle()));
+    bundleNow.accounts.hero.name = '导入改名';
+    const impRes = await api('POST', '/admin/import?merge=1', JSON.stringify(bundleNow), 'test-admin-key');
+    const impJson = JSON.parse(impRes.body);
+    ok(impRes.status === 200 && impJson.sessions && impJson.sessions.rebound >= 1,
+      '导入成功后按用户名把在线连接重绑了一遍', impRes.body.replace(/\s+/g, ' ').slice(0, 150));
+    ok(!!store.getAccount('hero') && store.getAccount('hero').name === '导入改名', '账号文档确实是新对象');
+    A.clear();
+    a.send(JSON.stringify({ t: 'profile', name: '导入后又改' }));
+    const pf = await A.wait((m) => m.t === 'account' && m.action === 'profile');
+    ok(pf.account && pf.account.name === '导入后又改', '在线连接改资料仍然生效');
+    await store.flush();
+    const nameOnDisk = JSON.parse(fs.readFileSync(path.join(dataDir, 'accounts.json'), 'utf8')).accounts.hero.name;
+    ok(nameOnDisk === '导入后又改', '写进的是新对象而不是被替换掉的孤儿（磁盘上能看到）', nameOnDisk);
+  }
+
   a.close();
+  await store.flush();   // 关服前把没落盘的改动写完，测试才敢直接读文件
 } finally {
   await stop();
   fs.rmSync(dataDir, { recursive: true, force: true });

@@ -70,6 +70,38 @@ function sendStart(ws, room) {
 }
 
 /**
+ * 登录态变了（注册 / 登录 / 改密码）：把「连接 → 房间成员 → 对局玩家」三处的身份一次对齐。
+ * 关键是 ws.token 也要跟着换成新会话 token：客户端拿它存 localStorage 并用来重连匹配，
+ * 登录后掉线如果房间那边还是旧 token，就会被当成新人请回大厅（对局里的位置也丢了）。
+ * 同样，成员上的 user 必须跟着换，不然存档归属和战绩记账会记到上一个账号头上。
+ */
+function adoptAccount(manager, ws, acc) {
+  ws.account = acc || null;
+  ws.session = acc ? acc.session : '';
+  if (acc) {
+    ws.name = safeName(acc.name);
+    if (acc.session) ws.token = acc.session;
+  }
+  const rec = manager.players.get(ws.pid);
+  const room = rec ? manager.getRoom(rec.roomCode) : null;
+  const np = room ? room.players.get(ws.pid) : null;
+  if (!np) return room;
+  np.user = acc ? acc.user : '';
+  np.name = ws.name;
+  np.token = ws.token;
+  if (acc) np.startWeapon = acc.prefs.startWeapon;
+  const gp = room.game ? room.game.players.get(ws.pid) : null;
+  if (gp) { gp.user = np.user; gp.name = np.name; }
+  room.broadcastRoom();
+  return room;
+}
+
+/** 会话是否还有效：别处登录 / 改密码 / 登出都会换发 session，旧连接必须重新登录 */
+function sessionAlive(ws) {
+  return !!ws.account && !!ws.session && ws.account.session === ws.session;
+}
+
+/**
  * @param opts.dataDir      数据目录（默认 <项目根>/data）；传 false 关掉账号/存档
  * @param opts.adminKey     管理口令；不给就自动生成 data/admin-key.txt
  * @param opts.requireLogin 是否强制登录才能建房/进房（默认 true）
@@ -80,7 +112,42 @@ export function createServer(opts = {}) {
   const accounts = store ? new AccountService(store) : null;
   const manager = new RoomManager({ store, accounts });
   const adminKey = store ? ensureAdminKey(dataDir, opts.adminKey || process.env.PB_ADMIN_KEY) : '';
-  const handleAdmin = store ? makeAdminHandler({ store, key: adminKey, manager }) : null;
+  /**
+   * 管理页导入会把账号文档整份换掉：在线的 ws.account 还指着旧对象，
+   * 继续改资料/记战绩就写进了一个已经没人引用的对象里（看起来成功，其实丢了）。
+   * 所以导入完必须按用户名重新查一遍，并把房间成员 / 对局玩家的身份一起对齐。
+   */
+  const rebindAccounts = () => {
+    let rebound = 0, loggedOut = 0;
+    for (const c of wss.clients) {
+      if (!c.account) continue;
+      const fresh = accounts ? accounts.get(c.account.user) : null;
+      if (fresh) { adoptAccount(manager, c, fresh); rebound++; continue; }
+      // 导入后这个账号没了：连接降级成未登录，房间里的位置保留（别人还在跟他打）
+      c.account = null;
+      c.session = '';
+      send(c, { t: 'account', ok: false, action: 'revoked', error: '账号数据被还原覆盖，需要重新登录' });
+      loggedOut++;
+    }
+    return { rebound, loggedOut };
+  };
+  /**
+   * 同一账号在别处登录 / 改了密码：其它连接手里的 session 已经作废，当场告诉它们并降级。
+   * 只撤「以这个账号行事」的能力 —— 人在对局里的位置、房间成员身份都保留，那是另一套 token 机制。
+   */
+  const revokeOtherSessions = (acc, exceptWs) => {
+    let n = 0;
+    for (const c of wss.clients) {
+      if (c === exceptWs || !c.account) continue;
+      if (c.account.user !== acc.user || c.session === acc.session) continue;   // 同一会话（同设备多标签页）不动
+      c.account = null;
+      c.session = '';
+      send(c, { t: 'account', ok: false, action: 'revoked', error: '这个账号在别处登录或改了密码，要重新登录' });
+      n++;
+    }
+    return n;
+  };
+  const handleAdmin = store ? makeAdminHandler({ store, key: adminKey, manager, afterImport: rebindAccounts }) : null;
   const requireLogin = opts.requireLogin !== false && !!store;
 
   const send404 = (res, why) => {
@@ -137,6 +204,12 @@ export function createServer(opts = {}) {
     const helloTimeout = setTimeout(() => { if (!joined) try { ws.close(); } catch { /* ignore */ } }, 15000);
 
     ws.on('message', (raw) => {
+      // 一条消息把处理器抛出去的话，整个进程会带着全房间的人一起倒，这里兜住
+      try { onMessage(raw); }
+      catch (e) { console.error('[ws] 处理消息出错，已忽略这条：', e && (e.stack || e.message) ? String(e.stack).split('\n').slice(0, 2).join(' | ') : e); }
+    });
+
+    function onMessage(raw) {
       let msg;
       try { msg = JSON.parse(raw.toString()); } catch { return; }
       if (!msg || typeof msg.t !== 'string') return;
@@ -175,8 +248,8 @@ export function createServer(opts = {}) {
         if (accounts) {
           const resumed = accounts.resume(msg.token);
           if (resumed) {
-            ws.account = resumed;
-            name = safeName(resumed.name);
+            adoptAccount(manager, ws, resumed);
+            name = ws.name;
           }
         }
         send(ws, {
@@ -207,8 +280,8 @@ export function createServer(opts = {}) {
         if (msg.t === 'register') {
           const r = accounts.register({ user: msg.user, pass: msg.pass, name: msg.name });
           if (r.error) return send(ws, { t: 'account', ok: false, error: r.error });
-          ws.account = r.account;
-          ws.name = r.account.name;
+          adoptAccount(manager, ws, r.account);
+          revokeOtherSessions(r.account, ws);            // 这个号在别处的登录态当场作废
           send(ws, { t: 'account', ok: true, action: 'register', account: publicView(r.account), token: r.account.session });
           send(ws, { t: 'rooms', rooms: manager.roomList() });
           return;
@@ -216,39 +289,45 @@ export function createServer(opts = {}) {
         if (msg.t === 'login') {
           const r = accounts.login({ user: msg.user, pass: msg.pass });
           if (r.error) return send(ws, { t: 'account', ok: false, error: r.error });
-          ws.account = r.account;
-          ws.name = safeName(r.account.name);
-          // 已经在某个房间里：把显示名同步过去
-          const rec2 = manager.players.get(ws.pid);
-          const room2 = rec2 ? manager.getRoom(rec2.roomCode) : null;
-          if (room2 && room2.players.get(ws.pid)) { room2.players.get(ws.pid).name = ws.account.name; room2.broadcastRoom(); }
+          // 会换发 session（旧设备的免密随之失效）—— 这里把连接、房间成员、对局玩家三处一起对齐
+          adoptAccount(manager, ws, r.account);
+          revokeOtherSessions(r.account, ws);            // 换发 session：老设备的免密登录到此为止
           send(ws, { t: 'account', ok: true, action: 'login', account: publicView(r.account), token: r.account.session });
           send(ws, { t: 'rooms', rooms: manager.roomList() });
           return;
         }
         if (msg.t === 'logout') {
           accounts.logout(ws.account);
+          // 只撤这条连接的登录态：人还在房间里继续打，但改资料 / 动存档要重新登录
           ws.account = null;
+          ws.session = '';
           send(ws, { t: 'account', ok: false, action: 'logout' });
           return;
         }
         if (!ws.account) return send(ws, { t: 'needLogin', msg: '先登录' });
         if (msg.t === 'profile') {
           accounts.setPrefs(ws.account, { name: msg.name, startWeapon: msg.startWeapon, autoSave: msg.autoSave });
-          const rec0 = manager.players.get(ws.pid);
-          const room0 = rec0 ? manager.getRoom(rec0.roomCode) : null;
-          const np0 = room0 ? room0.players.get(ws.pid) : null;
-          if (np0) { np0.name = ws.account.name; np0.startWeapon = ws.account.prefs.startWeapon; room0.broadcastRoom(); }
+          adoptAccount(manager, ws, ws.account);     // 显示名/开局武器要同步到房间成员和对局玩家
           send(ws, { t: 'account', ok: true, action: 'profile', account: publicView(ws.account) });
           return;
         }
         if (msg.t === 'passwd') {
           const r = accounts.changePassword(ws.account, msg.old, msg.pass);
           if (r.error) return send(ws, { t: 'account', ok: false, error: r.error });
+          adoptAccount(manager, ws, r.account);      // 换了 session：连接与房间里的 token 一起跟上
+          revokeOtherSessions(r.account, ws);        // 其它设备要重新登录才能改存档/资料
           send(ws, { t: 'account', ok: true, action: 'passwd', account: publicView(ws.account), token: ws.account.session });
           return;
         }
         return;
+      }
+
+      // 会话被撤销（在别的设备登录、改了密码、被管理页导入覆盖）：老连接不能再以这个账号行事。
+      // 注意只撤「账号相关」的能力 —— 人已经在对局里，掉线重连仍按 token 走，不该被踢出战斗。
+      if (ws.account && !sessionAlive(ws)) {
+        ws.account = null;
+        ws.session = '';
+        send(ws, { t: 'account', ok: false, action: 'revoked', error: '这个账号在别处登录或改了密码，要重新登录' });
       }
 
       if (requireLogin && !ws.account && NEEDS_LOGIN.has(msg.t)) {
@@ -309,7 +388,7 @@ export function createServer(opts = {}) {
           if (np && room) room.handle(np, msg);
           else send(ws, { t: 'err', msg: '你还没有加入房间' });
       }
-    });
+    }
 
     ws.on('close', () => {
       clearTimeout(helloTimeout);

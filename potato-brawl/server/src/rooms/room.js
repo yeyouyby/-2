@@ -4,6 +4,15 @@ import { LEVELS } from '../../../shared/level.js';
 import { Game } from '../game/game.js';
 import { applyCheckpoint, checkpointOf, saveSummary } from '../data/saves.js';
 
+/** owners 可能是手改坏的历史数据（对象/字符串/null）—— 统一成字符串数组再用 */
+function ownerListOf(run) {
+  const raw = run && (Array.isArray(run.owners) ? run.owners : (run.by ? [run.by] : []));
+  const list = Array.isArray(raw) ? raw : [];
+  const out = list.map((x) => String(x == null ? '' : x).slice(0, 20)).filter(Boolean);
+  if (run && run.by && !out.includes(String(run.by))) out.push(String(run.by).slice(0, 20));
+  return out;
+}
+
 // 所有会被拼进浏览器 innerHTML 的文本（聊天、房间名…）都先过一遍这里：
 // 尖括号/引号/与号一律剥掉，控制字符去掉，再截断长度。客户端那边也做了转义（双保险）。
 export function cleanText(input, max = 160) {
@@ -82,7 +91,7 @@ export class Room {
     this.overTimer = 0;
     this.createdAt = Date.now();
     this.slotSeq = 0;
-    this.lastCheckpointWave = -1;   // 自动存档去重：同一波只写一次
+    this.lastCheckpointTag = '';    // 自动存档去重：同一波 + 同一阶段只写一次
   }
 
   // ------------------------------------------------------------ 成员
@@ -163,16 +172,22 @@ export class Room {
     const users = this.memberUsers();
     if (!users.length) return { error: '没有人登录，存档不知道归谁（先登录再存）' };
     const g = this.game;
+    // 检查点的含义是「第 wave+1 波还没开打」。波中手存必须把已完成波数回退一格，
+    // 否则读档会直接跳到下一波，等于把正在打的这一波白送过去 —— 现在变成「本波从头打」。
+    const inWave = g.phase === PHASE.WAVE;
+    const done = Math.max(0, (g.wave | 0) - (inWave ? 1 : 0));
     const run = checkpointOf(g, {
-      label: `第 ${g.wave + 1} 波前`,
+      wave: done,
+      label: inWave ? `第 ${g.wave} 波（本波重打）` : `第 ${g.wave + 1} 波前`,
       owners: users,
       code: this.code,
     });
     run.by = (this.host && this.host.user) || users[0];
     const saved = this.store.putSave(run);
     for (const u of users) this.accounts && this.accounts.attachSave(u, saved.id);
-    this.lastCheckpointWave = g.wave;
-    return { ok: true, save: saved };
+    // 去重标记要带上阶段：波中存过之后，清完这一波进商店仍然该自动存一次
+    this.lastCheckpointTag = `${inWave ? 'w' : 'p'}${g.wave}`;
+    return { ok: true, save: saved, tag: this.lastCheckpointTag };
   }
 
   /** 本房间能看到的存档：自己名下的 + 房间成员名下的（可以跨房间码恢复） */
@@ -181,7 +196,7 @@ export class Room {
     const roomUsers = this.memberUsers();
     const me = np && np.user;
     return this.store.listSaves((r) => {
-      const owners = (r.owners || []).concat(r.by ? [r.by] : []);
+      const owners = ownerListOf(r);
       if (me && owners.includes(me)) return true;
       return owners.some((o) => roomUsers.includes(o));
     }).map(saveSummary);
@@ -192,7 +207,7 @@ export class Room {
     if (!this.store) return { error: '服务器没开存储' };
     const run = this.store.getSave(id);
     if (!run) return { error: '存档不存在（可能已被更新覆盖，或超出保存条数上限）' };
-    const owners = (run.owners || []).concat(run.by ? [run.by] : []);
+    const owners = ownerListOf(run);
     const mine = [byNp && byNp.user, ...this.memberUsers()].filter(Boolean);
     if (owners.length && !owners.some((o) => mine.includes(o))) return { error: '这不是你的存档' };
     if (this.game && this.game.phase !== PHASE.OVER && !byNp.host) return { error: '只有房主能读档' };
@@ -202,7 +217,7 @@ export class Room {
     this.game = null;
     this.start({ seed: Number(run.seed) >>> 0 });
     const res = applyCheckpoint(this.game, run);
-    this.lastCheckpointWave = res.wave;      // 别让自动存档马上又把刚读进来的这份盖掉
+    this.lastCheckpointTag = `p${res.wave}`;  // 别让自动存档马上又把刚读进来的这份盖掉
     this.broadcast({ t: 'loaded', id: run.id, wave: res.wave + 1, restored: res.restored });
     this.chat_('系统', `从检查点继续：第 ${res.wave + 1} 波（${run.mode === MODE.ENDLESS ? '无尽' : 'PvE'}），恢复了 ${res.restored} 人的 build`, true);
     if (res.warnings.length) this.chat_('系统', '读档提示：' + res.warnings.join('；'), true);
@@ -213,9 +228,11 @@ export class Room {
     if (!this.store) return { error: '服务器没开存储' };
     const run = this.store.getSave(id);
     if (!run) return { error: '存档不存在' };
-    const owners = (run.owners || []).concat(run.by ? [run.by] : []);
-    const allowed = (np && np.host) || (np && np.user && owners.includes(np.user));
-    if (!allowed) return { error: '只能删自己的存档' };
+    const owners = ownerListOf(run);
+    // 只认「这份存档归谁」：房主身份不构成对别人存档的处置权 —— 他能拿到 id 就能删掉整间房
+    // 都看不到的存档，那是越权
+    const allowed = !!(np && np.user && owners.includes(np.user));
+    if (!allowed) return { error: '只能删自己名下的存档' };
     this.store.deleteSave(id);
     if (this.accounts) for (const o of owners) this.accounts.detachSave(o, id);
     return { ok: true };
@@ -314,7 +331,7 @@ export class Room {
   }
 
   start(opts = {}) {
-    this.lastCheckpointWave = -1;
+    this.lastCheckpointTag = '';
     this.seed = opts.seed === undefined ? (Math.random() * 0xffffffff) >>> 0 : (opts.seed >>> 0);
     this.game = new Game(this);
     for (const np of this.players.values()) {
@@ -336,7 +353,7 @@ export class Room {
 
   backToLobby() {
     this.game = null;
-    this.lastCheckpointWave = -1;
+    this.lastCheckpointTag = '';
     for (const p of this.players.values()) p.ready = false;
     this.broadcast({ t: 'lobby' });
     this.broadcastRoom();
@@ -349,8 +366,8 @@ export class Room {
     this.tickCount++;
 
     // 检查点：只在「进商店」那一刻写（同一波只写一次）
-    if (g.phase === PHASE.PREP && this.lastCheckpointWave !== g.wave) {
-      this.lastCheckpointWave = g.wave;
+    if (g.phase === PHASE.PREP && this.lastCheckpointTag !== `p${g.wave}`) {
+      this.lastCheckpointTag = `p${g.wave}`;
       if (this.autoSaveOn()) {
         const r = this.checkpoint();
         if (r.ok) this.broadcast({ t: 'saved', id: r.save.id, wave: g.wave + 1, auto: true });

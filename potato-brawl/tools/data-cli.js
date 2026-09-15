@@ -36,9 +36,9 @@ function needStore() {
 }
 
 function busyCheck(what) {
-  const pid = JsonStore.dirBusy(dataDir);
-  if (pid && !has('force')) {
-    console.error(`\n  ❌ 服务器正在跑（pid ${pid}），${what}会跟它抢文件。`);
+  const busy = JsonStore.dirBusy(dataDir);
+  if (busy && !has('force')) {
+    console.error(`\n  ❌ 服务器正在跑（${typeof busy === 'number' ? 'pid ' + busy : busy}），${what}会跟它抢文件。`);
     console.error('     要么先用管理页 /admin，要么停掉服务器，要么加 --force（自己承担风险）。\n');
     process.exit(1);
   }

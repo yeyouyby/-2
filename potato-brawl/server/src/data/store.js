@@ -8,6 +8,7 @@
 // 退出前必须 close()（里面会 flush + 释放 .lock）。
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
+import crypto from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -27,8 +28,66 @@ function applyAccounts(store, doc) {
 }
 function applySaves(store, doc) {
   if (!doc || !doc.saves) return;
-  store.savesDoc = { ...EMPTY_SAVES(), ...doc, saves: doc.saves };
+  const saves = {};
+  let dropped = 0;
+  for (const [id, run] of Object.entries(doc.saves)) {
+    const clean = sanitizeRun(run, id);
+    if (clean) saves[id] = clean;
+    else dropped++;
+  }
+  store.savesDoc = { ...EMPTY_SAVES(), ...doc, saves };
   if (typeof store.savesDoc.seq !== 'number') store.savesDoc.seq = Object.keys(store.savesDoc.saves).length + 1;
+  if (dropped) console.error(`[data] saves.json 里有 ${dropped} 条记录形状不对，已忽略（其余照常可用）`);
+}
+
+const asArray = (x) => (Array.isArray(x) ? x : []);
+const asNum = (v, d = 0) => (Number.isFinite(Number(v)) ? Number(v) : d);
+
+/**
+ * 存档记录可能来自手改的文件或外部备份：逐条把形状过一遍，坏条目丢掉。
+ * 否则 listSaves / loadRun / forgetSave 这些读取点会在 WebSocket 回调里被 .concat() 抛出去。
+ */
+export function sanitizeRun(raw, id) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  if (raw.players !== undefined && !Array.isArray(raw.players)) return null;
+  const players = asArray(raw.players).filter((p) => p && typeof p === 'object' && !Array.isArray(p)).map((p) => ({
+    user: String(p.user == null ? '' : p.user).slice(0, 20),
+    name: String(p.name == null ? '土豆' : p.name).slice(0, 14) || '土豆',
+    slot: Math.max(0, asNum(p.slot, 0) | 0),
+    team: asNum(p.team, 0) | 0,
+    level: Math.max(1, asNum(p.level, 1) | 0),
+    xp: Math.max(0, asNum(p.xp)),
+    coins: Math.max(0, asNum(p.coins)),
+    kills: asNum(p.kills, 0) | 0,
+    deaths: asNum(p.deaths, 0) | 0,
+    damage: Math.max(0, asNum(p.damage)),
+    taken: Math.max(0, asNum(p.taken)),
+    hp: asNum(p.hp, 100),
+    items: (p.items && typeof p.items === 'object' && !Array.isArray(p.items)) ? p.items : {},
+    weapons: asArray(p.weapons).filter((x) => typeof x === 'string').slice(0, 6),
+  }));
+  const settings = (raw.settings && typeof raw.settings === 'object' && !Array.isArray(raw.settings)) ? raw.settings : {};
+  const owners = asArray(raw.owners).map((x) => String(x == null ? '' : x).slice(0, 20)).filter(Boolean);
+  const by = String(raw.by == null ? '' : raw.by).slice(0, 20);
+  if (by && !owners.includes(by)) owners.push(by);
+  return {
+    id: String(id || raw.id || ''),
+    v: DATA_VERSION,
+    label: String(raw.label == null ? '' : raw.label).slice(0, 24),
+    code: String(raw.code == null ? '' : raw.code).slice(0, 8),
+    owners,
+    by,
+    createdAt: asNum(raw.createdAt, 0),
+    updatedAt: asNum(raw.updatedAt, 0),
+    mode: typeof raw.mode === 'string' ? raw.mode : String(settings.mode || 'pve'),
+    settings,
+    seed: asNum(raw.seed, 0) >>> 0,
+    rngState: raw.rngState === undefined ? undefined : asNum(raw.rngState, 0),
+    tick: asNum(raw.tick, 0) | 0,
+    time: asNum(raw.time, 0),
+    wave: Math.max(0, asNum(raw.wave, 0) | 0),
+    players,
+  };
 }
 
 /** 账号入库前的形状整理：只留认识的字段，别把乱七八糟的东西一起写进文件 */
@@ -76,6 +135,8 @@ export class JsonStore {
     this.chain = Promise.resolve();
     this.timer = null;
     this.closed = false;
+    this.lockOwned = false;
+    this.lockId = crypto.randomBytes(4).toString('hex');   // 同一进程内也要能区分两个实例
   }
 
   get accountsFile() { return path.join(this.dir, 'accounts.json'); }
@@ -103,25 +164,49 @@ export class JsonStore {
   async load() { return this.loadSync(); }
 
   /** 给 CLI / 管理页提示「服务器是不是在跑」 */
-  acquireLock() {
+  readLock() {
     try {
-      const pid = Number(String(fs.readFileSync(this.lockFile, 'utf8')).trim());
-      if (pid && pid !== process.pid) {
-        try { process.kill(pid, 0); return false; } catch { /* 僵死锁，抢过来 */ }
-      }
-    } catch { /* 没有锁文件 */ }
-    try { fs.writeFileSync(this.lockFile, String(process.pid)); } catch { /* ignore */ }
+      const [pidRaw, id] = String(fs.readFileSync(this.lockFile, 'utf8')).trim().split(/\s+/);
+      return { pid: Number(pidRaw) || 0, id: id || '' };
+    } catch { return null; }
+  }
+
+  /**
+   * 锁按「pid + 实例 id」认主：只看 pid 的话，同一个进程里的第二个 JsonStore（测试会这么开多个
+   * 服务器）会以为锁是自己的，两个进程同时写同一批 JSON + 同一个 .tmp 文件，账号/存档就互相覆盖了。
+   */
+  acquireLock() {
+    const cur = this.readLock();
+    if (cur && cur.id !== this.lockId) {
+      let alive = false;
+      if (cur.pid) { try { process.kill(cur.pid, 0); alive = true; } catch { alive = false; } }
+      if (alive) return false;                  // 别的实例还在用这个目录
+    }
+    try { fs.writeFileSync(this.lockFile, `${process.pid} ${this.lockId}\n`); } catch { /* ignore */ }
+    this.lockOwned = true;
     return true;
   }
+
+  /** 别的进程（CLI 还原）正占着这个数据目录吗 —— 返回它的 pid（或同进程另一实例的标记） */
   static dirBusy(dir) {
     try {
-      const pid = Number(fs.readFileSync(path.join(dir, '.lock'), 'utf8').trim());
-      if (!pid || pid === process.pid) return false;
-      process.kill(pid, 0);
-      return pid;
+      const [pidRaw, id] = String(fs.readFileSync(path.join(dir, '.lock'), 'utf8')).trim().split(/\s+/);
+      const pid = Number(pidRaw) || 0;
+      if (!pid) return false;
+      if (pid === process.pid) return id ? `同进程实例 ${id}` : false;
+      try { process.kill(pid, 0); return pid; } catch { return false; }
     } catch { return false; }
   }
-  releaseLock() { try { fs.unlinkSync(this.lockFile); } catch { /* ignore */ } }
+
+  /** 只删自己那把锁：否则第二个进程（哪怕启动失败就退出）会把第一个的锁擦掉，又变成两个进程同时写 */
+  releaseLock() {
+    if (!this.lockOwned) return;
+    try {
+      const cur = this.readLock();
+      if (cur && cur.id === this.lockId) fs.unlinkSync(this.lockFile);
+    } catch { /* 已经没了 */ }
+    this.lockOwned = false;
+  }
 
   // ---------------------------------------------------------------- 账号
   static key(user) { return String(user || '').trim().toLowerCase(); }
@@ -162,7 +247,7 @@ export class JsonStore {
 
   putSave(run) {
     const id = run.id || ('s' + (this.savesDoc.seq++).toString(36) + Date.now().toString(36).slice(-4));
-    const rec = { ...run, id, v: DATA_VERSION, updatedAt: Date.now() };
+    const rec = { ...(sanitizeRun(run, id) || run), id, v: DATA_VERSION, updatedAt: Date.now() };
     this.savesDoc.saves[id] = rec;
     this.trimSaves();
     this.mark('saves');
@@ -216,11 +301,12 @@ export class JsonStore {
       accounts[k] = sanitizeAccount({ ...acc, user: acc.user || k0 });
     }
     let rawSaves = src.saves && typeof src.saves === 'object' ? src.saves : {};
-    if (Array.isArray(rawSaves)) { const o = {}; for (const s of rawSaves) if (s && s.id) o[s.id] = s; rawSaves = o; }
+    if (Array.isArray(rawSaves)) { const o = {}; for (const item of rawSaves) if (item && item.id) o[item.id] = item; rawSaves = o; }
     const saves = {};
     for (const [id, run] of Object.entries(rawSaves)) {
-      if (!run || typeof run !== 'object' || !Array.isArray(run.players)) { skipped++; continue; }
-      saves[String(id)] = { ...run, id: String(id), v: DATA_VERSION };
+      const clean = sanitizeRun(run, id);
+      if (!clean) { skipped++; continue; }
+      saves[String(id)] = clean;
     }
 
     if (merge) {
@@ -257,28 +343,69 @@ export class JsonStore {
 
   async writeDoc(file, doc) {
     const json = JSON.stringify(doc, null, 2) + '\n';     // 明文 + 缩进，方便直接看和改
-    const tmp = file + '.tmp';
-    await fsp.writeFile(tmp, json, 'utf8');
-    await fsp.rename(tmp, file);
+    // 临时名带上进程标记：两个实例同时写时不会互相踩对方的 .tmp（那会把内容拼成坏 JSON）
+    const tmp = `${file}.${process.pid}.${this.lockId}.tmp`;
+    try {
+      await fsp.writeFile(tmp, json, 'utf8');
+      await fsp.rename(tmp, file);
+    } catch (e) {
+      try { await fsp.unlink(tmp); } catch { /* 没建出来 */ }
+      throw e;
+    }
   }
 
-  flush() {
+  /**
+   * 真正写一次盘。**只有写成功的才清脏标记** —— 先 clear 再写的话，rename 一旦失败
+   * （盘满、权限、Windows 上文件被占用），内存里的改动就被当成已保存，重启全丢。
+   */
+  async flushOnce() {
     const which = new Set(this.dirty);
-    this.dirty.clear();
-    if (!which.size) return this.chain;
+    if (!which.size) return { ok: true, wrote: [] };
     const now = Date.now();
+    const wrote = [];
+    let error = null;
+    try { await fsp.mkdir(this.dir, { recursive: true }); } catch (e) { error = e; }
+    if (which.has('accounts') && !error) {
+      try { this.accountsDoc.updatedAt = now; await this.writeDoc(this.accountsFile, this.accountsDoc); wrote.push('accounts'); }
+      catch (e) { error = e; }
+    }
+    if (which.has('saves') && !error) {
+      try { this.savesDoc.updatedAt = now; await this.writeDoc(this.savesFile, this.savesDoc); wrote.push('saves'); }
+      catch (e) { error = e; }
+    }
+    for (const w of wrote) this.dirty.delete(w);
+    if (error) console.error('[data] 落盘失败，改动先留在内存里等下次重试：', error.message || error);
+    return { ok: !error, wrote, error };
+  }
+
+  /** 平时的落盘：串到写盘队列；失败就 2 秒后再试，不把没写成的改动标成已保存 */
+  flush() {
     this.chain = this.chain.then(async () => {
-      await fsp.mkdir(this.dir, { recursive: true });
-      if (which.has('accounts')) { this.accountsDoc.updatedAt = now; await this.writeDoc(this.accountsFile, this.accountsDoc); }
-      if (which.has('saves')) { this.savesDoc.updatedAt = now; await this.writeDoc(this.savesFile, this.savesDoc); }
-    }).catch((e) => { console.error('[data] 落盘失败', e && e.message); });
+      const r = await this.flushOnce();
+      if (!r.ok && this.dirty.size && !this.closed) {
+        if (this.timer) clearTimeout(this.timer);
+        this.timer = setTimeout(() => { this.timer = null; this.flush().catch(() => {}); }, 2000);
+        if (this.timer.unref) this.timer.unref();
+      }
+      return r;
+    });
     return this.chain;
   }
 
+  /** 退出前要写干净：重试几次还是失败就抛出去，让启动脚本报错，而不是假装保存好了 */
   async close() {
     this.closed = true;
     if (this.timer) { clearTimeout(this.timer); this.timer = null; }
-    await this.flush();
+    let last = { ok: true };
+    for (let i = 0; i < 4 && this.dirty.size; i++) {
+      last = await (this.chain = this.chain
+        .then(() => this.flushOnce())
+        .catch((e) => ({ ok: false, error: e })));
+      if (!last.ok && this.dirty.size && i < 3) await new Promise((r) => setTimeout(r, 150 * (i + 1)));
+    }
     this.releaseLock();
+    if (this.dirty.size) {
+      throw new Error(`有 ${[...this.dirty].join('/')} 没能写进 ${this.dir}：${(last.error && (last.error.code || last.error.message)) || '未知错误'}`);
+    }
   }
 }

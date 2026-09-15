@@ -19,7 +19,15 @@ const { server, manager, store, adminKey } = createServer({
 });
 
 if (store && !store.acquireLock()) {
-  console.warn('\n  ⚠️  data/.lock 被另一个进程占着，那个进程可能也在写同一批存档；继续启动，但请确认没同时开两个服务器。\n');
+  // 只是警告的话，第二个服务器照样跑起来跟第一个抢同一批 JSON（还会在退出时把对方的锁删掉）
+  if (!process.argv.includes('--force-data')) {
+    console.error('\n  ❌ 这个数据目录已经被另一个服务器进程占着：');
+    console.error(`     ${store.dir}`);
+    console.error('     同一个目录跑两个实例会把账号/存档写坏。');
+    console.error('     先关掉另一个，或者 --data-dir <别的目录> 分开数据；--force-data 可以强行启动（自担风险）。\n');
+    process.exit(1);
+  }
+  console.warn('\n  ⚠️ --force-data：明知 data/.lock 被别的实例占着还继续跑，两份数据可能互相覆盖。\n');
 }
 
 server.listen(PORT, HOST, () => {
@@ -66,13 +74,16 @@ async function shutdown(sig) {
   if (stopping) return;
   stopping = true;
   console.log(`\n  收到 ${sig}，正在把账号/存档写盘…`);
+  let code = 0;
   try {
-    if (store) await store.close();        // close() 里已经 flush + 释放锁
+    if (store) await store.close();        // close() 里会重试写盘 + 只释放自己的锁
   } catch (e) {
-    console.error('  落盘失败：', e && e.message);
+    console.error('  ❌ 数据没写干净，这部分改动可能丢了：', e && e.message);
+    console.error('     盘满 / 目录权限 / 文件被别的程序占着都会这样；处理完再重启，或用管理页导出备份。');
+    code = 1;
   }
   console.log('  服务端已停止，再见！');
-  process.exit(0);
+  process.exit(code);
 }
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));

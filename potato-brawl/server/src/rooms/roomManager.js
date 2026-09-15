@@ -42,7 +42,22 @@ export class RoomManager {
   joinRoom(code, ws, { id, name, token, user = '' }) {
     const room = this.getRoom(code);
     if (!room) return { error: '房间不存在' };
-    if (room.players.size >= room.settings.maxPlayers && !room.players.has(id)) {
+    // 已经在房间里又发了一个 join（客户端重连/重复点击都会）：只把 socket 和身份接回来。
+    // 绝不能重新 addPlayer —— 那会把对局里的人换成一个刚初始化的对象：满血回到出生点，
+    // 房主标记也会因为「房间非空」而丢掉。
+    if (room.players.has(id)) {
+      const cur = room.players.get(id);
+      cur.ws = ws;
+      cur.connected = true;
+      if (name) cur.name = name;
+      if (user) cur.user = user;
+      if (token) cur.token = token;
+      room.reconnect(id, ws);
+      this.players.set(id, { roomCode: room.code, id });
+      room.broadcastRoom();
+      return { room, np: cur, rejoin: true };
+    }
+    if (room.players.size >= room.settings.maxPlayers) {
       return { error: '房间已满' };
     }
     const np = room.addPlayer(ws, { id, name, token, user });

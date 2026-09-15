@@ -12,7 +12,7 @@ import * as Shop from '../game/shop.js';
 const MAX_LABEL = 24;
 
 /** 一局里「可恢复」的那部分 */
-export function checkpointOf(game, { label = '', owners = [], code = '' } = {}) {
+export function checkpointOf(game, { label = '', owners = [], code = '', wave } = {}) {
   return {
     label: String(label || '').slice(0, MAX_LABEL),
     code: String(code || '').slice(0, 8),
@@ -31,7 +31,7 @@ export function checkpointOf(game, { label = '', owners = [], code = '' } = {}) 
     rngState: game.rng.getState(),          // 随机数用到哪儿了也记下 → 读档后下一波和原来一致
     tick: game.tick,
     time: Math.round(game.time * 10) / 10,
-    wave: game.wave,                        // 已完成的波数；恢复后下一波是 wave + 1
+    wave: wave === undefined ? game.wave : Math.max(0, wave | 0),   // 已完成的波数；恢复后下一波是 wave + 1
     players: [...game.players.values()].map((p) => ({
       user: p.user || '',
       name: p.name,
@@ -72,8 +72,17 @@ export function applyCheckpoint(game, run) {
   let restored = 0;
   for (const r of saved) {
     const key = String(r.user || '').toLowerCase();
-    const p = (key && byUser.get(key)) || byName.get(String(r.name || '').toLowerCase());
-    if (!p) { warnings.push(`${r.name || r.user || '某玩家'} 不在这个房间里，他的成长没恢复`); continue; }
+    let p = key ? byUser.get(key) : null;
+    if (!p) {
+      // 显示名兜底只给「没有账号归属的记录」（老存档/游客）用；有 user 却查不到人，
+      // 说明那个人不在房间里 —— 这时候按名字硬套，等于让同名的人白拿别人一整套 build
+      const cand = byName.get(String(r.name || '').toLowerCase());
+      if (cand && !key && !cand.user) p = cand;
+    }
+    if (!p) {
+      warnings.push(`${r.name || r.user || '某玩家'} 不在这个房间里（或账号对不上），他的成长没恢复`);
+      continue;
+    }
     // 先把道具灌回去（maxHp 这类是道具算出来的），再把血量覆盖成存档当时的值
     p.items = {};
     for (const [id, n] of Object.entries(r.items || {})) {
@@ -103,7 +112,8 @@ export function applyCheckpoint(game, run) {
   }
   // 房间里但存档里没记录的人：按当前 build 进这一波，明确提示一下别让人以为丢了进度
   for (const p of game.players.values()) {
-    const known = saved.some((r) => (r.user && r.user === p.user) || r.name === p.name);
+    const known = saved.some((r) => (r.user && p.user && String(r.user).toLowerCase() === String(p.user).toLowerCase())
+      || (!r.user && !p.user && r.name === p.name));
     if (!known) warnings.push(`${p.name} 没有对应的存档记录，按当前 build 加入第 ${wave + 1} 波`);
   }
 
