@@ -50,7 +50,10 @@ export const PLAYER = {
 
 export const PLAYER_COLORS = ['#ff6b6b', '#4dabf7', '#51cf66', '#fcc419', '#cc5de8', '#22b8cf', '#ff922b', '#f783ac'];
 
-export const MODE = { PVE: 'pve', FFA: 'ffa', TEAM: 'team' };
+export const MODE = { PVE: 'pve', FFA: 'ffa', TEAM: 'team', ENDLESS: 'endless' };
+/** 合作打波次的模式（有波次/商店/倒地救援）：无尽走的是同一套流程，只是没有波数上限 */
+export const isCoop = (mode) => mode === MODE.PVE || mode === MODE.ENDLESS;
+export const isEndless = (mode) => mode === MODE.ENDLESS;
 export const PHASE = {
   LOBBY: 'lobby',
   COUNTDOWN: 'countdown',
@@ -73,6 +76,9 @@ export const DEFAULT_SETTINGS = {
   totalWaves: 20,
   difficulty: 1,
   prepTime: 20,
+  // 存档 / 无尽
+  autoSave: true,            // 每波开始前自动写一个检查点存档
+  endlessBonusEvery: 10,     // 无尽模式：每这么多波额外给一次三选一（0 = 关）
   // PvP
   scoreLimit: 20,
   timeLimit: 300,

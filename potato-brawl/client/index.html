@@ -20,8 +20,17 @@
     </header>
 
     <div class="panel home-panel">
+      <div class="account-box" id="account-box">
+        <div class="row gap" id="account-form">
+          <input id="inp-user" maxlength="20" placeholder="账号（2-20 位：中文/字母/数字/下划线）" autocomplete="username" />
+          <input id="inp-pass" type="password" maxlength="64" placeholder="密码（至少 4 位）" autocomplete="current-password" />
+          <button id="btn-login" class="primary">登录</button>
+          <button id="btn-register">注册</button>
+        </div>
+        <div class="acct-line" id="acct-line"></div>
+      </div>
       <div class="row gap">
-        <input id="inp-name" maxlength="14" placeholder="你的名字（最多 14 字）" />
+        <input id="inp-name" maxlength="14" placeholder="你的名字（最多 14 字，默认跟账号一致）" />
         <button id="btn-create" class="primary">创建房间</button>
       </div>
       <div class="row gap">
@@ -44,6 +53,8 @@
           <li><b>武器自动开火</b>（Brotato 式）：靠近敌人就会自动攻击，你只需要专注走位</li>
           <li><b>升级</b>：吃经验升级后按 <b>1/2/3</b> 或点击卡片三选一，堆出属于你的 build</li>
           <li><b>合作 PvE</b>：20 波怪物，每 5 波一个 Boss；波间用金币在商店买武器道具；队友倒地后站上去 3 秒可救起</li>
+          <li><b>无尽模式</b>：没有波数上限，每 5 波一个 Boss、每 10 波额外送一次三选一，撑到团灭为止，成绩记在账号上</li>
+          <li><b>存档点</b>：每进一次商店自动写一个检查点（房主也能随时手存），在大厅里可以「从存档点继续」，接着原来的波次和 build 打</li>
           <li><b>PvP</b>：死斗 / 团队战，场上会刷新武器箱与医疗包，击杀也能升级</li>
           <li><b>其它</b>：Tab 计分板 · C 属性面板 · Enter 聊天 · M 静音 · Esc 关闭面板</li>
         </ul>
@@ -76,6 +87,16 @@
           <button id="btn-start" class="big hidden">开始游戏</button>
         </div>
         <div id="lobby-tip" class="tip"></div>
+      </div>
+
+      <div class="panel save-panel">
+        <h3>存档点 <span class="muted" id="save-hint"></span></h3>
+        <div id="save-list" class="save-list"></div>
+        <div class="row gap">
+          <button id="btn-save-now" class="ghost small">💾 存到这一刻</button>
+          <button id="btn-save-refresh" class="ghost small">刷新列表</button>
+        </div>
+        <div class="tip" id="save-tip"></div>
       </div>
 
       <div class="panel chat-panel">
@@ -111,6 +132,7 @@
     <div class="tb-right">
       <span id="tb-ping" class="muted small">--</span>
       <button id="btn-mute" class="ghost small" title="静音 (M)">🔊</button>
+      <button id="btn-savegame" class="ghost small" title="存到检查点（房主）">💾</button>
       <button id="btn-quit" class="ghost small">退出</button>
     </div>
   </div>

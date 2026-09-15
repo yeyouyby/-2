@@ -7,10 +7,13 @@ import { Room, makeCode, send } from './room.js';
 export const MAX_ROOMS = 64;
 
 export class RoomManager {
-  constructor() {
+  /** opts.store / opts.accounts：明文 JSON 存储与账号服务，Room 通过 manager 拿到 */
+  constructor(opts = {}) {
     this.rooms = new Map(); // code -> Room
     this.players = new Map(); // wsId -> {roomCode, id}
     this.lobbySockets = new Set(); // 在大厅（未加入房间）的连接
+    this.store = opts.store || null;
+    this.accounts = opts.accounts || null;
   }
 
   createRoom(opts) {
@@ -36,16 +39,13 @@ export class RoomManager {
     this.broadcastRoomList();
   }
 
-  joinRoom(code, ws, { id, name, token }) {
+  joinRoom(code, ws, { id, name, token, user = '' }) {
     const room = this.getRoom(code);
     if (!room) return { error: '房间不存在' };
     if (room.players.size >= room.settings.maxPlayers && !room.players.has(id)) {
       return { error: '房间已满' };
     }
-    if (room.game && room.game.phase !== 'over' && room.settings.mode === 'pve' && room.game.wave > 0) {
-      // 允许中途加入，但提示
-    }
-    const np = room.addPlayer(ws, { id, name, token });
+    const np = room.addPlayer(ws, { id, name, token, user });
     this.players.set(id, { roomCode: room.code, id });
     room.chat_('系统', `${name} 加入了房间`, true);
     room.broadcastRoom();

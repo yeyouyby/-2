@@ -24,6 +24,12 @@ net.on('chat', (m) => ui.chatLine(m.name, m.text, m.sys));
 net.on('over', (m) => ui.onOver(m.result));
 net.on('lobby', () => { game.stop(); ui.onLobby(); });
 net.on('err', (m) => ui.toast(m.msg));
+net.on('welcome', (m) => ui.onWelcome(m));
+net.on('account', (m) => ui.onAccount(m));
+net.on('needLogin', (m) => ui.needLoginTip(m));
+net.on('saveList', (m) => ui.renderSaves(m.saves));
+net.on('saved', (m) => ui.onSaved(m));
+net.on('loaded', (m) => ui.onLoaded(m));
 
 net.connect();
 

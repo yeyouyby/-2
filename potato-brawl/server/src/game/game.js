@@ -1,5 +1,5 @@
 // 权威游戏世界：60Hz 定步长模拟，20Hz 快照广播
-import { MODE, PHASE, PLAYER, PVP, TEAM } from '../../../shared/constants.js';
+import { MODE, PHASE, PLAYER, PVP, TEAM, isCoop, isEndless } from '../../../shared/constants.js';
 import { getLevel } from '../../../shared/level.js';
 import { ENEMY_DEFS } from '../../../shared/enemies.js';
 import { WEAPONS, weaponById } from '../../../shared/weapons.js';
@@ -50,11 +50,11 @@ export class Game {
 
   addPlayer(net) {
     const p = P.createPlayer(this, {
-      id: net.id, name: net.name, slot: net.slot, team: net.team,
+      id: net.id, name: net.name, slot: net.slot, team: net.team, user: net.user || '',
     });
     const want = net.startWeapon || 'pistol';
     P.grantWeapon(p, want);
-    if (this.settings.mode !== MODE.PVE) {
+    if (!isCoop(this.settings.mode)) {                // PvP 开局多给一把 + 两件随机道具（无尽是合作模式，不给）
       P.grantWeapon(p, want === 'fist' ? 'pistol' : 'fist');
       for (let i = 0; i < 2; i++) {
         const it = this.rng.pick(ITEMS.filter((x) => x.rarity === 'common'));
@@ -105,7 +105,7 @@ export class Game {
     switch (this.phase) {
       case PHASE.COUNTDOWN:
         if (this.phaseTimer <= 0) {
-          if (this.settings.mode === MODE.PVE) this.beginPrep(true);
+          if (isCoop(this.settings.mode)) this.beginPrep(true);
           else { this.phase = PHASE.PLAYING; }
         }
         break;
@@ -186,6 +186,12 @@ export class Game {
     return any;
   }
 
+  /** 波数上限：无尽模式返回 0（=没有上限，撑到团灭为止） */
+  waveLimit() {
+    if (isEndless(this.settings.mode)) return 0;
+    return Math.max(1, this.settings.totalWaves | 0 || 20);
+  }
+
   beginWave(n) {
     this.wave = n;
     this.spawnQueue = buildWaveQueue(this, n).sort((a, b) => a.t - b.t);
@@ -194,6 +200,17 @@ export class Game {
     this.phaseTimer = 0;
     for (const p of this.players.values()) p.shop = null;
     this.addEvent({ t: 'wave', n, boss: n % 5 === 0 });
+    // 无尽模式的长线成长：每 endlessBonusEvery 波额外送一次三选一，不然纯靠刷怪数值早就崩了
+    if (isEndless(this.settings.mode)) {
+      const every = this.settings.endlessBonusEvery | 0;
+      if (every > 0 && n > 0 && n % every === 0) {
+        for (const p of this.players.values()) {
+          p.pendingLevels += 1;
+          P.refreshChoices(this, p);
+        }
+        this.addEvent({ t: 'endlessbonus', n, every });
+      }
+    }
   }
 
   updateWave(dt) {
@@ -203,8 +220,9 @@ export class Game {
       this.spawnFromQueue(s);
     }
     if (!this.spawnQueue.length && this.enemies.length === 0 && this.waveClock > 1) {
-      if (this.wave >= (this.settings.totalWaves || 20)) this.endGame(true, 'clear');
-      else this.beginPrep();
+      const cap = this.waveLimit();
+      if (cap > 0 && this.wave >= cap) this.endGame(true, 'clear');
+      else this.beginPrep();          // 无尽：cap 是 0，永远走到这里，一波接一波
       return;
     }
     // 全员倒地/阵亡 → 失败
@@ -314,7 +332,7 @@ export class Game {
       for (const p of this.players.values()) if (p.alive && !p.downed) out.push(p);
       return out;
     }
-    if (this.settings.mode === MODE.PVE) return this.enemies;
+    if (isCoop(this.settings.mode)) return this.enemies;
     const out = [];
     for (const p of this.players.values()) {
       if (p === owner || !p.alive || p.downed) continue;
@@ -361,7 +379,7 @@ export class Game {
     }
     if (p.hp <= 0) {
       p.hp = 0;
-      if (this.settings.mode === MODE.PVE) this.downPlayer(p, source);
+      if (isCoop(this.settings.mode)) this.downPlayer(p, source);
       else this.killPlayer(p, source);
     }
     return true;

@@ -21,10 +21,11 @@ export function recomputeStats(p) {
   void before;
 }
 
-export function createPlayer(game, { id, name, slot, team = TEAM.NONE }) {
+export function createPlayer(game, { id, name, slot, team = TEAM.NONE, user = '' }) {
   const spawn = game.level.spawns[slot % game.level.spawns.length];
   const p = {
     id, name, slot, team,
+    user,                       // 所属账号：存档和战绩要按人归属（游客为空）
     color: PLAYER_COLORS[slot % PLAYER_COLORS.length],
     x: spawn.x, y: spawn.y, w: PLAYER.w, h: PLAYER.h,
     vx: 0, vy: 0, facing: 1, onGround: false,

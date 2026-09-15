@@ -10,7 +10,11 @@
     "test": "node test/headless-test.js",
     "test:jump": "node test/enemy-jump-test.js",
     "test:safety": "node test/net-safety-test.js",
-    "lan": "node server/index.js --host 0.0.0.0 --port 3000"
+    "lan": "node server/index.js --host 0.0.0.0 --port 3000",
+    "backup": "node tools/data-cli.js export",
+    "restore": "node tools/data-cli.js import",
+    "data": "node tools/data-cli.js list",
+    "test:account": "node test/account-save-test.js"
   },
   "dependencies": {
     "ws": "^8.18.0"

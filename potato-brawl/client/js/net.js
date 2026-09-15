@@ -49,6 +49,9 @@ export class Net {
       let m;
       try { m = JSON.parse(e.data); } catch { return; }
       if (m.t === 'welcome') { this.id = m.id; this.token = m.token; localStorage.setItem('pb_token', m.token); }
+      // 登录/注册成功后服务器发的就是「会话 token」：存下来，刷新页面就能免密重连
+      if (m.t === 'account' && m.ok && m.token) { this.token = m.token; localStorage.setItem('pb_token', m.token); }
+      if (m.t === 'account' && m.action === 'logout') { this.token = ''; localStorage.setItem('pb_token', ''); }
       if (m.t === 'pong') this.ping = Math.round(performance.now() - this._lastPingSent);
       this.emit(m.t, m);
       this.emit('*', m);

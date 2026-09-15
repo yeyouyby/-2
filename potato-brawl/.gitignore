@@ -1,4 +1,8 @@
 # 依赖目录（压缩包里已内置，不用提交进 git）
 node_modules/
+# 运行时生成的明文数据与备份（只指项目根这两个目录；server/src/data/ 是源码，别误伤）
+/data/
+/backups/
+
 npm-debug.log*
 .DS_Store

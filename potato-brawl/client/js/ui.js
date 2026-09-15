@@ -1,5 +1,5 @@
 // 界面层：首页 / 大厅 / 游戏内 HUD / 升级卡 / 商店 / 计分板 / 结算
-import { MODE, PHASE } from '/shared/constants.js';
+import { MODE, PHASE, isCoop } from '/shared/constants.js';
 import { ITEM_BY_ID, RARITY_NAME, RARITY_COLOR } from '/shared/items.js';
 import { WEAPON_BY_ID, TIER_COLOR } from '/shared/weapons.js';
 import { weaponById } from '/shared/weapons.js';
@@ -46,6 +46,142 @@ export class UI {
 
   attach(game) { this.game = game; }
 
+  // ------------------------------------------------------------ 账号 / 存档点
+  sendAuth(action) {
+    const user = $('inp-user').value.trim();
+    const pass = $('inp-pass').value;
+    if (!user || !pass) return this.toast('账号和密码都要填');
+    const name = $('inp-name').value.trim();
+    this.net.send({ t: action, user, pass, name: name || undefined });
+    this.toast(action === 'login' ? '登录中…' : '注册中…');
+  }
+
+  onWelcome(m) {
+    this.account = m.account || null;
+    this.needLogin = !!m.needLogin;
+    this.accountsOn = m.accountsOn !== false;
+    if (this.account && this.account.name && !$('inp-name').value) $('inp-name').value = this.account.name;
+    if (this.account) { $('inp-user').value = this.account.user; }
+    this.renderAccount();
+  }
+
+  onAccount(m) {
+    if (m.action === 'logout') {
+      this.account = null; this.needLogin = true;
+      this.toast('已退出登录'); this.renderAccount(); return;
+    }
+    if (m.ok) {
+      this.account = m.account; this.needLogin = false;
+      if (m.account && m.account.name) $('inp-name').value = m.account.name;
+      this.toast(m.action === 'register' ? `注册成功，欢迎 ${m.account.user}！` : `已登录：${m.account.user}`);
+      this.renderAccount();
+      if (this.room) this.net.send({ t: 'saves' });
+      return;
+    }
+    this.account = null; this.needLogin = true;
+    this.toast(m.error || '没成功');
+    this.renderAccount();
+  }
+
+  needLoginTip(m) {
+    this.needLogin = true;
+    this.toast(m.msg || '先登录再玩');
+    this.renderAccount();
+    this.showScreen('home');
+    const u = $('inp-user');
+    if (u && !u.value) u.focus();
+  }
+
+  renderAccount() {
+    const line = $('acct-line'), form = $('account-form');
+    if (!line) return;
+    if (!this.accountsOn) {
+      form.classList.add('hidden');
+      line.innerHTML = '<span class="muted">这个服务器没开账号系统（--no-data 启动的），直接建房就能玩</span>';
+      return;
+    }
+    const a = this.account;
+    if (a) {
+      const st = a.stats || {};
+      const en = st.endless || {};
+      form.classList.add('hidden');
+      line.innerHTML = `<span class="acct-on">✅ <b>${esc(a.user)}</b> · 显示名 ${esc(a.name)}</span>
+        <span class="muted small">${st.matches || 0} 场 · 胜 ${st.wins || 0} · 最高第 ${st.bestWave || 0} 波 · 无尽最高 ${en.bestWave || 0} 波 / ${en.bestTime || 0}s · 存档 ${a.saves || 0} 份</span>
+        <button class="ghost small" id="btn-acct-pass">改密码</button>
+        <button class="ghost small" id="btn-acct-out">退出</button>`;
+      $('btn-acct-out').onclick = () => this.net.send({ t: 'logout' });
+      $('btn-acct-pass').onclick = () => {
+        const old = prompt('原密码：');
+        if (old === null) return;
+        const np = prompt('新密码（至少 4 位）：');
+        if (np === null) return;
+        this.net.send({ t: 'passwd', old, pass: np });
+      };
+    } else {
+      form.classList.remove('hidden');
+      line.innerHTML = this.needLogin
+        ? '<span class="warn">要先登录 / 注册才能建房、进房</span>'
+        : '<span class="muted">注册个账号就能记战绩和存档；数据是服务器上的明文 JSON，随时可备份还原</span>';
+    }
+  }
+
+  get iAmHost() {
+    if (!this.room) return false;
+    const me = this.room.players.find((p) => p.id === this.net.id);
+    return !!(me && me.host);
+  }
+
+  renderSaves(list) {
+    this.saves = list || [];
+    const box = $('save-list');
+    if (!box) return;
+    const host = this.iAmHost;
+    $('save-hint').textContent = `${this.saves.length} 份 · 明文存在服务器 data/saves.json`;
+    $('save-tip').textContent = host
+      ? '进商店时自动写检查点；读档会重开一局并接着存档里的波次和 build。'
+      : '只有房主能读档 / 手存；你也可以自己开房，读自己账号下的存档。';
+    if (!this.saves.length) {
+      box.innerHTML = '<div class="empty">还没有存档。开一局 PvE 或无尽，第一次进商店时会自动写一个检查点。</div>';
+      return;
+    }
+    const fmt = (ts) => {
+      const d = new Date(ts || 0);
+      const p = (n) => String(n).padStart(2, '0');
+      return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+    };
+    box.innerHTML = this.saves.map((r) => {
+      const who = (r.players || []).map((x) => `${esc(x.name)} Lv${x.level}`).join('、') || '—';
+      return `<div class="save-item">
+        <div class="si-main"><b>${esc(r.label || '检查点')}</b>
+          <span class="muted small">${fmt(r.createdAt)} · ${r.mode === 'endless' ? '无尽' : 'PvE'} · 共 ${r.wave} 人：<span class="mono">${who}</span></span></div>
+        <div class="si-btns">
+          <button class="primary small" data-load="${esc(r.id)}" ${host ? '' : 'disabled'}>从这里开始</button>
+          <button class="ghost small" data-del="${esc(r.id)}">删</button>
+        </div></div>`;
+    }).join('');
+    box.querySelectorAll('[data-load]').forEach((b) => {
+      b.onclick = () => {
+        const r = this.saves.find((x) => x.id === b.dataset.load);
+        if (!confirm(`用「${r ? r.label : b.dataset.load}」继续？
+会覆盖当前房间的进度，直接进入第 ${r ? r.wave : '?'} 波前的商店。`)) return;
+        this.net.send({ t: 'saveLoad', id: b.dataset.load });
+      };
+    });
+    box.querySelectorAll('[data-del]').forEach((b) => {
+      b.onclick = () => { if (confirm('删掉这份存档？')) this.net.send({ t: 'saveDelete', id: b.dataset.del }); };
+    });
+  }
+
+  onSaved(m) {
+    this.toast(`已写检查点：第 ${m.wave} 波前${m.auto ? '（自动）' : ''}`);
+    if (m.id) this.net.send({ t: 'saves' });
+  }
+
+  onLoaded(m) {
+    this.toast(`从存档点继续：第 ${m.wave} 波（恢复 ${m.restored} 人）`);
+    if (this.game && this.game.mode && this.screen === 'game') this.banner(`📂 从第 ${m.wave} 波继续`, 3);
+  }
+
   showScreen(id) {
     for (const el of document.querySelectorAll('.screen')) el.classList.remove('active');
     $(`screen-${id}`).classList.add('active');
@@ -73,6 +209,12 @@ export class UI {
     $('btn-leave').onclick = () => this.leaveRoom();
     $('btn-ready').onclick = () => this.setReady(!this.ready);
     $('btn-start').onclick = () => this.net.send({ t: 'start' });
+    $('btn-login').onclick = () => this.sendAuth('login');
+    $('btn-register').onclick = () => this.sendAuth('register');
+    $('inp-pass').addEventListener('keydown', (e) => { if (e.key === 'Enter') this.sendAuth('login'); });
+    $('btn-save-now').onclick = () => this.net.send({ t: 'saveNow' });
+    $('btn-save-refresh').onclick = () => this.net.send({ t: 'saves' });
+    $('btn-savegame').onclick = () => this.net.send({ t: 'saveNow' });
     $('chat-form').onsubmit = (e) => {
       e.preventDefault();
       const v = $('chat-input').value.trim();
@@ -262,6 +404,10 @@ export class UI {
     $('lobby-count').textContent = `${state.players.length}/${state.maxPlayers}`;
     const me = state.players.find((p) => p.id === this.net.id);
     this.ready = me ? me.ready : false;
+    if (this.account && this._saveReq !== state.code + (me && me.host ? 'h' : '')) {
+      this._saveReq = state.code + (me && me.host ? 'h' : '');
+      this.net.send({ t: 'saves' });        // 每个房间/身份拉一次就够，后面靠 saved/loaded 推
+    }
     $('btn-ready').textContent = this.ready ? '取消准备' : '准备';
     $('btn-start').classList.toggle('hidden', !(me && me.host));
 
@@ -300,13 +446,15 @@ export class UI {
     const isHost = me && me.host;
     const s = state.settings;
     $('settings-box').innerHTML = `
-      ${this.segRow('模式', 'mode', [['pve', '合作 PvE'], ['ffa', '死斗 PvP'], ['team', '团队 PvP']], s.mode, isHost)}
+      ${this.segRow('模式', 'mode', [['pve', '合作 PvE'], ['endless', '无尽模式'], ['ffa', '死斗 PvP'], ['team', '团队 PvP']], s.mode, isHost)}
       ${this.segRow('地图', 'levelId', [['farm', '土豆农场'], ['cellar', '地窖酒馆']], s.levelId, isHost)}
       ${this.segRow('人数上限', 'maxPlayers', [2, 3, 4, 6, 8].map((n) => [n, n + ' 人']), s.maxPlayers, isHost)}
-      ${s.mode === 'pve'
-        ? `${this.segRow('总波数', 'totalWaves', [[10, '10 波'], [20, '20 波'], [30, '30 波']], s.totalWaves, isHost)}
+      ${isCoop(s.mode)
+        ? `${s.mode === 'pve' ? this.segRow('总波数', 'totalWaves', [[10, '10 波'], [20, '20 波'], [30, '30 波']], s.totalWaves, isHost) : ''}
            ${this.segRow('难度', 'difficulty', [[0.7, '休闲'], [1, '标准'], [1.35, '困难'], [1.8, '地狱']], s.difficulty, isHost)}
-           ${this.segRow('备战时长', 'prepTime', [[12, '12 秒'], [20, '20 秒'], [35, '35 秒']], s.prepTime, isHost)}`
+           ${this.segRow('备战时长', 'prepTime', [[12, '12 秒'], [20, '20 秒'], [35, '35 秒']], s.prepTime, isHost)}
+           ${s.mode === 'endless' ? this.segRow('无尽奖励', 'endlessBonusEvery', [[0, '不加'], [5, '每 5 波'], [10, '每 10 波'], [15, '每 15 波']], s.endlessBonusEvery, isHost) : ''}
+           ${this.segRow('波间存档', 'autoSave', [[1, '自动写检查点'], [0, '只手动']], s.autoSave ? 1 : 0, isHost)}`
         : `${this.segRow('分数上限', 'scoreLimit', [[10, '10 分'], [20, '20 分'], [30, '30 分']], s.scoreLimit, isHost)}
            ${this.segRow('时间上限', 'timeLimit', [[180, '3 分钟'], [300, '5 分钟'], [600, '10 分钟']], s.timeLimit, isHost)}`}
     `;
@@ -315,7 +463,9 @@ export class UI {
       btn.onclick = () => {
         const key = btn.dataset.key;
         let val = btn.dataset.val;
-        val = ['maxPlayers', 'totalWaves', 'scoreLimit', 'timeLimit'].includes(key) ? Number(val) : (isNaN(Number(val)) ? val : Number(val));
+        if (key === 'autoSave') val = val === '1';
+        else if (key === 'endlessBonusEvery' || ['maxPlayers', 'totalWaves', 'scoreLimit', 'timeLimit'].includes(key)) val = Number(val);
+        else val = isNaN(Number(val)) ? val : Number(val);
         this.net.send({ t: 'settings', settings: { [key]: val } });
       };
     });
@@ -323,7 +473,8 @@ export class UI {
     // 提示
     const tips = [];
     if (!isHost) tips.push('等房主开始游戏');
-    else if (state.players.length < 2 && s.mode !== 'pve') tips.push('PvP 至少需要 2 名玩家');
+    else if (state.players.length < 2 && !isCoop(s.mode)) tips.push('PvP 至少需要 2 名玩家');
+    else if (s.mode === 'endless') tips.push('无尽模式：撑到团灭为止，成绩记在账号上');
     else tips.push('所有人准备后即可开始');
     $('lobby-tip').textContent = tips.join(' · ');
   }
@@ -341,9 +492,9 @@ export class UI {
     $('scoreboard').classList.add('hidden');
     $('killfeed').innerHTML = '';
     $('game-chat-log').innerHTML = '';
-    $('tb-mode').textContent = { pve: '合作 PvE', ffa: '死斗 PvP', team: '团队 PvP' }[msg.mode] || msg.mode;
-    $('tb-timer').classList.toggle('hidden', msg.mode === 'pve');
-    $('tb-wave').classList.toggle('hidden', msg.mode !== 'pve');
+    $('tb-mode').textContent = { pve: '合作 PvE', endless: '无尽模式', ffa: '死斗 PvP', team: '团队 PvP' }[msg.mode] || msg.mode;
+    $('tb-timer').classList.toggle('hidden', isCoop(msg.mode));
+    $('tb-wave').classList.toggle('hidden', !isCoop(msg.mode));
     this.banner('准备…', 2.5);
     this.audio.ensure();
   }
@@ -354,10 +505,11 @@ export class UI {
     const ph = s.ph;
 
     // 顶部
-    if (this.game && this.game.mode === 'pve') {
+    if (this.game && isCoop(this.game.mode)) {
+      const cap = this.game.mode === 'endless' || !s.tw ? '∞' : s.tw;
       $('tb-wave').textContent = s.ph === 'wave' && s.e.length
-        ? `波次 ${s.w} / ${s.tw} · 剩余 ${s.e.length}`
-        : `波次 ${s.w} / ${s.tw}`;
+        ? `波次 ${s.w} / ${cap} · 剩余 ${s.e.length}`
+        : `波次 ${s.w} / ${cap}`;
       const boss = s.e.find((e) => e.t === 'boss');
       const bb = $('bossbar');
       if (boss) {

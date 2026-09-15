@@ -2,7 +2,9 @@
 
 一个可以**在局域网里联机**的 2D 横版动作 Roguelite 网页游戏，自带**权威服务器**（Node.js + WebSocket）。
 
-- **合作 PvE**：4 人一起打 20 波怪物，每 5 波一个 Boss，波间开商店买武器道具，队友倒地可以救
+- **合作 PvE / 无尽模式**：最多 8 人守 20 波（每 5 波一个 Boss），或者切「无尽」—— 没有波数上限，每 10 波额外送一次三选一，撑到团灭为止，成绩记在账号上
+- **账号 + 存档点**：注册/登录后才有战绩和存档；每进一次商店自动写一个「波次检查点」，房主可以从任意检查点接着打（波次、等级、武器、道具、金币都接回去）
+- **数据全明文可备份**：账号/战绩/存档都是 `data/*.json`，管理页或 `npm run backup` 一键导出，导入即可还原或换机器
 - **PvP**：死斗（FFA）/ 团队战，场上刷武器箱和医疗包，击杀也能升级
 - **Brotato 式 build 流**：武器全自动开火，你只管走位；击杀掉经验 → 升级三选一 → 堆出属于自己的流派
 - **手感优先的网络同步**：60Hz 服务器模拟 + 客户端预测 + 服务器回滚校正 + 快照插值
@@ -77,20 +79,27 @@ potato-brawl/
 ├── server/
 │   ├── index.js            # 入口：监听端口、打印局域网地址
 │   └── src/
-│       ├── net/server.js   # HTTP 静态服务 + WebSocket 网关 + 60Hz 主循环
+│       ├── net/server.js   # HTTP 静态服务 + WebSocket 网关 + 登录闸门 + 60Hz 主循环
+│       ├── net/admin.js    # /admin 管理页：备份导出 / 导入还原（口令保护）
 │       ├── rooms/          # RoomManager（建房/加入/列表）与 Room（状态机/消息路由）
 │       └── game/
 │           ├── game.js     # ★ 权威世界：模拟循环、战斗结算、快照序列化
 │           ├── player.js   # 玩家实体、属性计算、自动开火、升级
 │           ├── enemies.js  # 敌人 AI（扑跳/冲刺/飞行/远程/坦克/自爆/Boss 三招）
 │           ├── nav.js      # ★ 地面怪的跳平台导航：挑跳板 + 二段跳时机（v1.0.4）
+│       ├── data/
+│           ├── store.js    # ★ 明文 JSON 存储（账号 + 存档），合并写 + 原子替换
+│           ├── accounts.js # 注册/登录/会话/战绩（密码明文，见文件头的安全说明）
+│           └── saves.js     # 波次检查点：存什么、怎么套回新的一局
 │           ├── waves.js    # 波次编排
 │           ├── shop.js     # 波间商店
 │           └── rng.js      # 可复现随机数（同种子 = 同一局）
 ├── client/                 # 原生 JS 客户端（无构建、无框架、无外部素材）
 │   ├── index.html  css/style.css
 │   └── js/ net.js input.js audio.js game.js render.js ui.js main.js
-└── test/                   # 无头集成测试 / 浏览器 E2E / 性能基准
+├── tools/data-cli.js       # 命令行备份：export / import / list / verify
+├── data/                   # ← 运行时生成：accounts.json / saves.json / admin-key.txt（明文，已 gitignore）
+└── test/                   # 无头集成测试 / 账号存档回归 / 浏览器 E2E / 性能基准
 ```
 
 ---
@@ -184,6 +193,53 @@ potato-brawl/
 
 ---
 
+## 三点五、账号 / 存档点 / 备份还原
+
+### 账号
+
+- 首页最上面注册/登录（用户名 2-20 位：中文/字母/数字/下划线；密码 ≥4 位）。**没登录不能建房 / 进房**（`--no-login` 可关掉这个要求，`--no-data` 干脆不开账号系统）。
+- 登录成功后服务器发一个会话 token，客户端存进 `localStorage`，刷新页面免密重连；一个账号同时只有一个有效会话（在新设备登录，旧设备的免密会失效）。
+- 连错 8 次密码锁 60 秒；`/api` 层面每个连接每分钟最多 12 次登录尝试。
+- 账号上挂着：显示名、开局武器偏好、战绩（场次/胜场/最高波数/击杀/伤害/时长）、无尽纪录、存档 id 列表。
+- ⚠️ **密码是明文存的**（本次需求明确要求「明文存储所有信息，服务器可信」）：`data/accounts.json` 里能直接看到 `pass`。要放公网必须先改成 hash —— 改 `server/src/data/accounts.js` 里 `register()` / `login()` 两处即可，其它逻辑不用动。
+
+### 存档点（波次检查点）
+
+存的是「进度 + 成长」，不存战斗过程：
+
+| 存什么 | 什么时候存 |
+| --- | --- |
+| 波次、种子 + 随机数状态、tick/时长、设置（模式/地图/难度/波数/备战时长/无尽奖励）、每个账号的等级、经验、金币、击杀、伤害、道具、武器、血量 | 每次进商店（打完一波）自动写一份；房主在大厅或游戏内点 💾 随时手存 |
+
+为什么不在战斗中间存：那要把敌人/弹幕的位置一起序列化，还要处理客户端预测的大跳变（读档瞬间人被拉回去会被预测吃掉）。波次边界是天然的干净点 —— 怪清空、人站在地面、商店开着，读档 = 开一局新的对局再把成长灌回去，网络和物理一行都不用改。
+
+- 读档：大厅【存档点】面板 → 房主点「从这里开始」→ 直接进入存档那一波前的商店，接着原来的 build 打。
+- 恢复后**下一波的出场队列是确定的**：存档里连 `rng` 的内部状态一起记了（`makeRng(seed, state)`），同一份存档读两次队列一模一样（测试里锁住了这条）。
+- 按账号归属：只有存档的 owner（或同房间成员）能读/删；新加入房间的人按当前 build 进这一波，不会被存档卡住。
+- `data/saves.json` 最多留 200 条，超了丢最老的。
+
+### 备份导出 / 导入还原
+
+| 入口 | 用法 |
+| --- | --- |
+| 管理页 | `http://<服务器>:3000/admin`，口令在 `data/admin-key.txt`（首次启动自动生成并打印在日志里）。导出=下载一份 JSON；导入支持「合并」，覆盖式导入前自动写 `data/backup-before-import-*.json` 方便回滚 |
+| 命令行 | `npm run backup`（→ `backups/potato-brawl-backup-<时间>.json`）、`npm run data`（列账号/存档）、`npm run restore backups/xxx.json`、`node tools/data-cli.js verify <文件>` |
+
+- 备份包是一个自包含的明文 JSON：`{ kind, v, exportedAt, counts, accounts, saves, saveSeq }`，`kind`/`v` 不对就拒绝导入；里面混了坏条目会跳过并计数（`skipped`），不会连累好数据。
+- 换机器 = 新机器 `npm run restore` 一次那个 JSON。
+- 服务器在跑时命令行 `import` 会拒绝（`data/.lock` 里是活着的 pid），避免两边抢文件写坏；那种情况请用管理页。
+- 手改 `data/*.json` 可以，但要在服务器停着时改 —— 运行中改会被内存里的版本盖掉，正确姿势是「导出 → 改 → 导入」。
+- `data/` 和 `backups/` 已加进 `.gitignore`，别把明文密码提交进仓库。
+
+### 无尽模式
+
+- 设置里把模式切到「无尽模式」：没有波数上限（`game.waveLimit() === 0`），打完一波直接进下一波的商店，只有全员倒地才结束（`reason: 'wipe'`），不会出现「通关」。
+- 每 5 波一个 Boss（沿用原节奏）；每 `endlessBonusEvery`（默认 10，可设 0 关掉 / 5 / 15）波**额外给一次三选一**，作为长线成长，不然纯吃数值到 30 波左右就顶不住了。
+- 服务器压力可控：刷怪预算本来就 `Math.min(52, ...)`、同屏敌人上限 140，波数再高也只是数值更凶，不会把 tick 拖爆（实测见下面性能表）。
+- 成绩记在账号上：`stats.endless = { runs, bestWave, bestTime, bestKills }`，破了纪录房间里会广播一条 🏆 系统消息。
+
+---
+
 ## 四、测试
 
 ```bash
@@ -191,6 +247,7 @@ npm test                          # 无头集成测试：PvE / FFA / TEAM 三个
 node test/perf-test.js            # 性能基准：8 人 + 70 怪 + 满弹幕，测 tick 耗时
 node test/enemy-jump-test.js      # 敌人跳平台/二段跳回归测试（含稳定性与边界用例）
 node test/net-safety-test.js      # 联机层安全/健壮性回归（含真 WebSocket 端到端）
+node test/account-save-test.js    # 账号 / 检查点存档 / 备份还原 / 无尽模式（含管理页与 CLI）
 node test/browser-verify.js       # 真实浏览器 E2E（需要 npx playwright install chromium）
 ```
 
@@ -205,6 +262,12 @@ node test/browser-verify.js       # 真实浏览器 E2E（需要 npx playwright 
 ---
 
 ## 四点五、改动记录
+
+### v1.0.5 · 账号 + 波次检查点存档 + 备份还原 + 无尽模式
+
+新增 `server/src/data/`（明文 JSON 存储 / 账号 / 存档）与 `server/src/net/admin.js`（管理页）、`tools/data-cli.js`（命令行备份）、`test/account-save-test.js`（104 项回归）。
+协议只加了消息类型（`register`/`login`/`logout`/`profile`/`passwd`/`saves`/`saveNow`/`saveLoad`/`saveDelete` 与下行 `account`/`needLogin`/`saveList`/`saved`/`loaded`），
+没动 `snap`/`input` 的形状，也没碰预测/回滚；`start` 多带一次「读档后的种子」而已。详见上面《三点五》一节。
 
 ### v1.0.4b · 联机层安全/健壮性修复（按 Qodo review）
 
@@ -261,6 +324,9 @@ node test/browser-verify.js       # 真实浏览器 E2E（需要 npx playwright 
 
 - **快照是明文 JSON 全量**，人多怪多时带宽偏高。要优化可以做：实体增删改的 delta 压缩、数值定点量化、只发视野内实体（当前是整张竞技场可见，所以砍不了视野）。
 - **没有做反作弊校验**（速度 hack / 穿墙）。局域网熟人开黑场景够用；若要上公网，需要加服务端输入合法性检查（位移上限、冷却校验）。
+- **账号数据是明文存盘**（含密码），按需求如此：整台机器可信、数据要能直接读改/备份。放公网前请至少把 `pass` 改 hash、`data/` 目录权限收紧、管理口令改成环境变量而不是文件。
+- 存档是**波次检查点**，不是战斗回放：正在打的那一波中间没法「回到 3 秒前」。要精确到帧的全量快照得先解决读档时客户端预测的大跳变。
+- 无尽模式没有排行榜（只有个人纪录）；要全服榜就把 `stats.endless.bestWave` 汇到一张表里，`/admin/stats` 顺手能显示。
 - **没有移动端触屏摇杆**，目前是键鼠。
 - 可以加的玩法：单人练习（加 AI 陪练 bot）、更多地图与 Boss、天赋/角色选择、观战、录像回放（种子已可复现，回放只需记输入流）。
 

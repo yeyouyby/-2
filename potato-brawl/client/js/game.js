@@ -203,6 +203,10 @@ export class GameClient {
         if (e.id === this.myId) this.audio.jump();
         this.sparks(e.x, e.y, 3, '#e8d5b7');
         break;
+      case 'endlessbonus':
+        // 无尽模式：每 N 波额外一次三选一，横幅提醒一下别错过
+        if (this.ui) this.ui.banner(`🎁 第 ${e.n} 波奖励：额外三选一！`, 3.2);
+        break;
       case 'edouble':
         // 怪物二段跳上平台：脚下顶一圈尘土，让玩家一眼看出「它追上来了」
         if (this.particles.length < MAX_PARTICLES) {

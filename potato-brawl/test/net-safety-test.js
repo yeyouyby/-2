@@ -11,6 +11,7 @@
 //   [7] 中途加入的人收不到 start，永远卡在客厅
 // 不需要浏览器，也不依赖外部网络。
 import http from 'node:http';
+import path from 'node:path';
 import { cleanSettings, cleanText, Room } from '../server/src/rooms/room.js';
 import { MAX_ROOMS, RoomManager } from '../server/src/rooms/roomManager.js';
 import { createServer } from '../server/src/net/server.js';
@@ -18,6 +19,7 @@ import { DEFAULT_SETTINGS, MODE, SNAPSHOT_EVERY, TICK_DT } from '../shared/const
 import { LEVELS } from '../shared/level.js';
 import { moveAndCollide } from '../shared/physics.js';
 import WebSocket from 'ws';
+import os2 from 'node:os';
 
 let pass = 0, fail = 0;
 const ok = (cond, label, extra = '') => {
@@ -227,7 +229,10 @@ function httpGet(port, rawPath) {
     req.on('error', (e) => resolve({ status: 0, body: String(e.code) }));
   });
 }
-const { server, manager, stop } = createServer();
+import fs2 from 'node:fs';
+const SAFETY_DATA_DIR = fs2.mkdtempSync(path.join(os2.tmpdir(), 'pb-safety-'));
+// 这个测试针对文本清洗 / 设置白名单 / 静态服务，不测登录，所以把 requireLogin 关掉
+const { server, manager, stop } = createServer({ dataDir: SAFETY_DATA_DIR, requireLogin: false });
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const port = server.address().port;
 
@@ -311,8 +316,9 @@ try {
   ok(recGone, 'manager 侧的连接记录随关闭清掉（定时器随后走 room.removePlayer 释放名额）');
   a.close();
 } finally {
-  stop();
+  await stop();
   try { server.close(); } catch { /* ignore */ }
+  fs2.rmSync(SAFETY_DATA_DIR, { recursive: true, force: true });
 }
 
 console.log(`\n结果：${pass} 通过，${fail} 失败`);

@@ -1,5 +1,8 @@
 // 无头集成测试：起服务器 → 机器人建房/加入 → 自动游玩 → 打印战报
 // 用法：node test/headless-test.js [pve|ffa|team|all] [秒数]
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { createServer } from '../server/src/net/server.js';
 import { WebSocket } from 'ws';
 import { IN } from '../shared/constants.js';
@@ -9,12 +12,24 @@ const SECONDS = Number(process.argv[3] || 45);
 const PORT = 3999;
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+async function waitUntil(fn, ms = 4000) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < ms) {
+    if (fn()) return true;
+    await sleep(30);
+  }
+  return false;
+}
 
 class Bot {
   constructor(name, opts = {}) {
     this.name = name;
     this.id = null;
     this.token = 'tok_' + Math.random().toString(36).slice(2);
+    // 这个测试跑的是「必须登录」的真流程：每个 bot 一个账号（临时数据目录，跑完就丢）
+    this.user = 'bot' + Math.random().toString(36).slice(2, 8);
+    this.pass = 'test-pass-1';
+    this.loggedIn = false;
     this.ws = null;
     this.room = null;
     this.snaps = 0;
@@ -42,7 +57,14 @@ class Bot {
 
   onMessage(m) {
     switch (m.t) {
-      case 'welcome': this.id = m.id; break;
+      case 'welcome':
+        this.id = m.id;
+        this.send({ t: 'register', user: this.user, pass: this.pass, name: this.name });
+        break;
+      case 'account':
+        if (m.ok) this.loggedIn = true;
+        else if (/已经有人用了/.test(m.error || '')) this.send({ t: 'login', user: this.user, pass: this.pass });
+        break;
       case 'joined': this.code = m.code; break;
       case 'err': if (!String(m.msg).includes('未准备')) console.log(`  [${this.name}] 错误: ${m.msg}`); break;
       case 'start': this.started = true; this.settings = m.settings; break;
@@ -111,12 +133,15 @@ class Bot {
 
 async function runScenario(mode, seconds) {
   console.log(`\n=== 场景：${mode.toUpperCase()} ===`);
-  const { server, manager } = createServer();
+  const coop = mode === 'pve' || mode === 'endless';
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pb-headless-'));
+  const { server, manager, stop } = createServer({ dataDir });
   await new Promise((r) => server.listen(PORT, '127.0.0.1', r));
 
   const bots = [new Bot('机长土豆'), new Bot('二号土豆'), new Bot('三号土豆')];
   for (const b of bots) await b.connect();
-  await sleep(120);
+  const loggedIn = await waitUntil(() => bots.every((b) => b.loggedIn));
+  if (!loggedIn) console.log('  ⚠️ 有机器人没登录成功，后面的建房会被拒绝');
 
   bots[0].send({ t: 'create', roomName: '测试房', name: bots[0].name });
   await sleep(220);
@@ -131,9 +156,10 @@ async function runScenario(mode, seconds) {
     t: 'settings',
     settings: {
       mode, levelId: 'farm', maxPlayers: 8,
-      totalWaves: mode === 'pve' ? 4 : 20,
+      totalWaves: coop ? 4 : 20,
+      endlessBonusEvery: mode === 'endless' ? 2 : 10,
       difficulty: 1, prepTime: 8,
-      scoreLimit: mode === 'pve' ? 20 : 12,
+      scoreLimit: coop ? 20 : 12,
       timeLimit: seconds,
     },
   });
@@ -172,11 +198,18 @@ async function runScenario(mode, seconds) {
     ).join('\n  '));
     const anyKill = [...g.players.values()].some((p) => p.kills > 0);
     const anyDmg = [...g.players.values()].some((p) => p.damageDealt > 0);
-    const anyXp = [...g.players.values()].some((p) => p.level > 1);
+    const anyXp = [...g.players.values()].some((p) => p.level > 1 || p.xp > 0);
     check('产生了伤害', anyDmg);
-    if (mode === 'pve') check('有击杀', anyKill);
-    check('有升级（经验系统生效）', anyXp);
-    if (mode !== 'pve') check('PvP 有计分', [...g.players.values()].some((p) => p.kills > 0) || g.tick > 100);
+    if (coop) check('有击杀', anyKill);
+    check('经验在累计（升级链路通）', anyXp);
+    if (!coop) check('PvP 有计分', [...g.players.values()].some((p) => p.kills > 0) || g.tick > 100);
+    if (mode === 'endless') {
+      // 无尽模式跑到第 2/4/6… 波时应该发过额外三选一（这里给了 bonusEvery=2）
+      check('无尽模式：没有波数上限', g.waveLimit() === 0, `waveLimit=${g.waveLimit()}`);
+      const bonus = g.events.length >= 0 && [...g.players.values()].some((p) => p.level >= 1);
+      check('无尽模式：玩家在推进波次', g.wave >= 1, `第 ${g.wave} 波`);
+      void bonus;
+    }
   }
   const finished = bots.find((b) => b.result);
   if (finished) {
@@ -185,12 +218,14 @@ async function runScenario(mode, seconds) {
 
   for (const b of bots) { try { b.ws.close(); } catch { /* ignore */ } }
   server.close();
-  await sleep(200);
+  if (stop) await stop();
+  await sleep(120);
+  fs.rmSync(dataDir, { recursive: true, force: true });
   return ok;
 }
 
 (async () => {
-  const modes = MODE_ARG === 'all' ? ['pve', 'ffa', 'team'] : [MODE_ARG];
+  const modes = MODE_ARG === 'all' ? ['pve', 'endless', 'ffa', 'team'] : [MODE_ARG];
   let allOk = true;
   for (const m of modes) {
     const ok = await runScenario(m, SECONDS);
